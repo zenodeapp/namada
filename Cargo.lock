@@ -5212,7 +5212,10 @@ version = "0.40.0"
 dependencies = [
  "namada_core",
  "namada_macros",
+ "namada_state",
  "namada_storage",
+ "namada_tx",
+ "namada_vp",
  "smooth-operator",
  "thiserror",
 ]
