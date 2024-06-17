@@ -2,9 +2,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{btree_map, BTreeMap, BTreeSet};
-use std::env;
 use std::fmt::Debug;
-use std::path::PathBuf;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use itertools::Itertools;
@@ -55,6 +53,7 @@ use namada_ibc::{decode_message, extract_masp_tx_from_envelope, IbcMessage};
 use namada_macros::BorshDeserializer;
 #[cfg(feature = "migrations")]
 use namada_migrations::*;
+#[cfg(feature = "validation")]
 pub use namada_token::validation::{
     partial_deauthorize, preload_verifying_keys, PVKs, CONVERT_NAME,
     ENV_VAR_MASP_PARAMS_DIR, OUTPUT_NAME, SPEND_NAME,
@@ -3260,11 +3259,13 @@ pub mod testing {
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "validation"))]
 /// Implementation of MASP functionality depending on a standard filesystem
 pub mod fs {
+    use std::env;
     use std::fs::{File, OpenOptions};
     use std::io::{Read, Write};
+    use std::path::PathBuf;
 
     use namada_token::validation::{
         get_params_dir, CONVERT_NAME, ENV_VAR_MASP_PARAMS_DIR, OUTPUT_NAME,
