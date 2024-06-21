@@ -2,92 +2,117 @@
 
 use std::cell::RefCell;
 
-use namada_gas::Gas;
-use namada_sdk::queries::{EncodedResponseQuery, RequestCtx, RequestQuery};
-use namada_state::{DBIter, ResultExt, StorageHasher, DB};
-use namada_tx::data::{GasLimit, TxResult};
+use namada_sdk::borsh::BorshSerializeExt;
+use namada_sdk::gas::{GasMetering, TxGasMeter};
+use namada_sdk::parameters;
+use namada_sdk::queries::{EncodedResponseQuery, RequestQuery};
+use namada_sdk::state::{
+    DBIter, ResultExt, StorageHasher, StorageResult, TxIndex, DB,
+};
+use namada_sdk::tx::data::{ExtendedTxResult, GasLimit, TxResult, TxType};
+use namada_sdk::tx::Tx;
+use namada_vm::wasm::{TxCache, VpCache};
+use namada_vm::WasmCacheAccess;
 
-use super::protocol;
-use crate::vm::wasm::{TxCache, VpCache};
-use crate::vm::WasmCacheAccess;
+use crate::protocol;
+use crate::protocol::ShellParams;
 
 /// Dry run a transaction
-pub fn dry_run_tx<'a, D, H, CA>(
-    mut ctx: RequestCtx<'a, D, H, VpCache<CA>, TxCache<CA>>,
+pub fn dry_run_tx<D, H, CA>(
+    mut state: namada_sdk::state::TempWlState<'static, D, H>,
+    mut vp_wasm_cache: VpCache<CA>,
+    mut tx_wasm_cache: TxCache<CA>,
     request: &RequestQuery,
-) -> namada_state::StorageResult<EncodedResponseQuery>
+) -> StorageResult<EncodedResponseQuery>
 where
     D: 'static + DB + for<'iter> DBIter<'iter> + Sync,
     H: 'static + StorageHasher + Sync,
     CA: 'static + WasmCacheAccess + Sync,
 {
-    use borsh_ext::BorshSerializeExt;
-    use namada_gas::{GasMetering, TxGasMeter};
-    use namada_tx::data::TxType;
-    use namada_tx::Tx;
-
-    use crate::ledger::protocol::ShellParams;
-    use crate::storage::TxIndex;
-
-    let mut temp_state = ctx.state.with_temp_write_log();
     let tx = Tx::try_from(&request.data[..]).into_storage_result()?;
     tx.validate_tx().into_storage_result()?;
 
+    let gas_scale = parameters::get_gas_scale(&state)?;
+
     // Wrapper dry run to allow estimating the gas cost of a transaction
-    let (mut tx_result, tx_gas_meter) = match tx.header().tx_type {
-        TxType::Wrapper(wrapper) => {
-            let gas_limit =
-                Gas::try_from(wrapper.gas_limit).into_storage_result()?;
-            let tx_gas_meter = RefCell::new(TxGasMeter::new(gas_limit));
-            let tx_result = protocol::apply_wrapper_tx(
-                &tx,
-                &wrapper,
-                &request.data,
-                &tx_gas_meter,
-                &mut temp_state,
-                None,
-            )
-            .into_storage_result()?;
-
-            temp_state.write_log_mut().commit_tx();
-            let available_gas = tx_gas_meter.borrow().get_available_gas();
-            (tx_result, TxGasMeter::new_from_sub_limit(available_gas))
-        }
-        _ => {
-            // If dry run only the inner tx, use the max block gas as
-            // the gas limit
-            let max_block_gas =
-                namada_parameters::get_max_block_gas(ctx.state)?;
-            let gas_limit = Gas::try_from(GasLimit::from(max_block_gas))
+    let (wrapper_hash, extended_tx_result, tx_gas_meter) =
+        match tx.header().tx_type {
+            TxType::Wrapper(wrapper) => {
+                let gas_limit = wrapper
+                    .gas_limit
+                    .as_scaled_gas(gas_scale)
+                    .into_storage_result()?;
+                let tx_gas_meter = RefCell::new(TxGasMeter::new(gas_limit));
+                let mut shell_params = ShellParams::new(
+                    &tx_gas_meter,
+                    &mut state,
+                    &mut vp_wasm_cache,
+                    &mut tx_wasm_cache,
+                );
+                let tx_result = protocol::apply_wrapper_tx(
+                    &tx,
+                    &wrapper,
+                    &request.data,
+                    &TxIndex::default(),
+                    &tx_gas_meter,
+                    &mut shell_params,
+                    None,
+                )
                 .into_storage_result()?;
-            (TxResult::default(), TxGasMeter::new(gas_limit))
-        }
-    };
 
+                state.write_log_mut().commit_tx_to_batch();
+                let available_gas = tx_gas_meter.borrow().get_available_gas();
+                (
+                    Some(tx.header_hash()),
+                    tx_result,
+                    TxGasMeter::new_from_sub_limit(available_gas),
+                )
+            }
+            _ => {
+                // If dry run only the inner tx, use the max block gas as
+                // the gas limit
+                let max_block_gas = parameters::get_max_block_gas(&state)?;
+                let gas_limit = GasLimit::from(max_block_gas)
+                    .as_scaled_gas(gas_scale)
+                    .into_storage_result()?;
+                (
+                    None,
+                    TxResult::default().to_extended_result(None),
+                    TxGasMeter::new(gas_limit),
+                )
+            }
+        };
+
+    let ExtendedTxResult {
+        mut tx_result,
+        ref masp_tx_refs,
+        is_ibc_shielding: _,
+    } = extended_tx_result;
     let tx_gas_meter = RefCell::new(tx_gas_meter);
-    for cmt in tx.commitments() {
+    for cmt in protocol::get_batch_txs_to_execute(&tx, masp_tx_refs) {
         let batched_tx = tx.batch_ref_tx(cmt);
         let batched_tx_result = protocol::apply_wasm_tx(
             batched_tx,
             &TxIndex(0),
             ShellParams::new(
                 &tx_gas_meter,
-                &mut temp_state,
-                &mut ctx.vp_wasm_cache,
-                &mut ctx.tx_wasm_cache,
+                &mut state,
+                &mut vp_wasm_cache,
+                &mut tx_wasm_cache,
             ),
         );
         let is_accepted =
             matches!(&batched_tx_result, Ok(result) if result.is_accepted());
         if is_accepted {
-            temp_state.write_log_mut().commit_tx_to_batch();
+            state.write_log_mut().commit_tx_to_batch();
         } else {
-            temp_state.write_log_mut().drop_tx();
+            state.write_log_mut().drop_tx();
         }
-        tx_result
-            .batch_results
-            .0
-            .insert(cmt.get_hash(), batched_tx_result);
+        tx_result.batch_results.insert_inner_tx_result(
+            wrapper_hash.as_ref(),
+            either::Right(cmt),
+            batched_tx_result,
+        );
     }
     // Account gas for both batch and wrapper
     tx_result.gas_used = tx_gas_meter.borrow().get_tx_consumed_gas();
@@ -97,7 +122,7 @@ where
         data,
         proof: None,
         info: Default::default(),
-        height: ctx.state.in_mem().get_last_block_height(),
+        height: state.in_mem().get_last_block_height(),
     })
 }
 
@@ -105,25 +130,24 @@ where
 mod test {
     use borsh::BorshDeserialize;
     use borsh_ext::BorshSerializeExt;
-    use namada_core::address;
-    use namada_core::hash::Hash;
-    use namada_core::storage::{BlockHeight, Key};
+    use namada_sdk::events::log::EventLog;
+    use namada_sdk::hash::Hash;
     use namada_sdk::queries::{
-        EncodedResponseQuery, RequestCtx, RequestQuery, Router, RPC,
+        Client, EncodedResponseQuery, RequestCtx, RequestQuery, Router, RPC,
     };
+    use namada_sdk::state::testing::TestState;
+    use namada_sdk::state::StorageWrite;
+    use namada_sdk::storage::{BlockHeight, Key};
     use namada_sdk::tendermint_rpc::{Error as RpcError, Response};
-    use namada_state::testing::TestState;
-    use namada_state::StorageWrite;
+    use namada_sdk::tx::data::TxType;
+    use namada_sdk::tx::{Code, Data, Tx};
+    use namada_sdk::{address, token};
     use namada_test_utils::TestWasms;
-    use namada_tx::data::TxType;
-    use namada_tx::{Code, Data, Tx};
+    use namada_vm::wasm::{TxCache, VpCache};
+    use namada_vm::{wasm, WasmCacheRoAccess};
     use tempfile::TempDir;
 
-    use crate::ledger::events::log::EventLog;
-    use crate::ledger::queries::Client;
-    use crate::token;
-    use crate::vm::wasm::{TxCache, VpCache};
-    use crate::vm::{wasm, WasmCacheRoAccess};
+    use super::*;
 
     /// A test client that has direct access to the storage
     pub struct TestClient<RPC>
@@ -160,14 +184,14 @@ mod test {
 
             // Initialize mock gas limit
             let max_block_gas_key =
-                namada_parameters::storage::get_max_block_gas_key();
+                namada_sdk::parameters::storage::get_max_block_gas_key();
             state
                 .db_write(&max_block_gas_key, 20_000_000_u64.serialize_to_vec())
                 .expect(
                     "Max block gas parameter must be initialized in storage",
                 );
             // Initialize mock gas scale
-            let gas_scale_key = namada_parameters::storage::get_gas_scale_key();
+            let gas_scale_key = parameters::storage::get_gas_scale_key();
             state
                 .db_write(&gas_scale_key, 100_000_000_u64.serialize_to_vec())
                 .expect("Gas scale parameter must be initialized in storage");
@@ -189,8 +213,7 @@ mod test {
         }
     }
 
-    #[cfg_attr(feature = "async-send", async_trait::async_trait)]
-    #[cfg_attr(not(feature = "async-send"), async_trait::async_trait(?Send))]
+    #[async_trait::async_trait(?Send)]
     impl<RPC> Client for TestClient<RPC>
     where
         RPC: Router + Sync,
@@ -214,19 +237,29 @@ mod test {
                 height: height.try_into().unwrap(),
                 prove,
             };
-            let ctx = RequestCtx {
-                state: &self.state,
-                event_log: &self.event_log,
-                vp_wasm_cache: self.vp_wasm_cache.clone(),
-                tx_wasm_cache: self.tx_wasm_cache.clone(),
-                storage_read_past_height_limit: None,
-            };
             // TODO(namada#3240): this is a hack to propagate errors to the
             // caller, we should really permit error types other
             // than [`std::io::Error`]
             if request.path == RPC.shell().dry_run_tx_path() {
-                super::dry_run_tx(ctx, &request)
+                dry_run_tx(
+                    // This is safe because nothing else is using `self.state`
+                    // concurrently and the `TempWlState` will be dropped right
+                    // after dry-run.
+                    unsafe {
+                        self.state.read_only().with_static_temp_write_log()
+                    },
+                    self.vp_wasm_cache.clone(),
+                    self.tx_wasm_cache.clone(),
+                    &request,
+                )
             } else {
+                let ctx = RequestCtx {
+                    state: self.state.read_only(),
+                    event_log: &self.event_log,
+                    vp_wasm_cache: self.vp_wasm_cache.clone(),
+                    tx_wasm_cache: self.tx_wasm_cache.clone(),
+                    storage_read_past_height_limit: None,
+                };
                 self.rpc.handle(ctx, &request)
             }
             .map_err(|err| {
@@ -243,8 +276,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_shell_queries_router_with_client()
-    -> namada_state::StorageResult<()> {
+    async fn test_shell_queries_router_with_client() -> StorageResult<()> {
         // Initialize the `TestClient`
         let mut client = TestClient::new(RPC);
         // store the wasm code

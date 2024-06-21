@@ -3,35 +3,33 @@
 use data_encoding::HEXUPPER;
 use masp_primitives::merkle_tree::CommitmentTree;
 use masp_primitives::sapling::Node;
-use namada::core::storage::{BlockResults, Epoch, Header};
-use namada::events::Event;
-use namada::gas::event::GasUsed;
-use namada::governance::pgf::inflation as pgf_inflation;
-use namada::hash::Hash;
-use namada::ledger::events::extend::{
+use namada_sdk::events::extend::{
     ComposeEvent, Height, Info, MaspTxBatchRefs, MaspTxBlockIndex, TxHash,
 };
-use namada::ledger::events::EmitEvents;
-use namada::ledger::gas::GasMetering;
-use namada::ledger::ibc;
-use namada::ledger::pos::namada_proof_of_stake;
-use namada::ledger::protocol::{DispatchArgs, DispatchError};
-use namada::proof_of_stake;
-use namada::proof_of_stake::storage::{
+use namada_sdk::events::{EmitEvents, Event};
+use namada_sdk::gas::event::GasUsed;
+use namada_sdk::gas::GasMetering;
+use namada_sdk::governance::pgf::inflation as pgf_inflation;
+use namada_sdk::hash::Hash;
+use namada_sdk::parameters::get_gas_scale;
+use namada_sdk::proof_of_stake::storage::{
     find_validator_by_raw_hash, write_last_block_proposer_address,
 };
-use namada::state::write_log::StorageModification;
-use namada::state::{ResultExt, StorageWrite, EPOCH_SWITCH_BLOCKS_DELAY};
-use namada::tx::data::protocol::ProtocolTxType;
-use namada::tx::data::VpStatusFlags;
-use namada::tx::event::{Batch, Code};
-use namada::tx::new_tx_event;
-use namada::vote_ext::ethereum_events::MultiSignedEthEvent;
-use namada::vote_ext::ethereum_tx_data_variants;
-use parameters::get_gas_scale;
+use namada_sdk::state::write_log::StorageModification;
+use namada_sdk::state::{ResultExt, StorageWrite, EPOCH_SWITCH_BLOCKS_DELAY};
+use namada_sdk::storage::{BlockResults, Epoch, Header};
+use namada_sdk::tx::data::protocol::ProtocolTxType;
+use namada_sdk::tx::data::VpStatusFlags;
+use namada_sdk::tx::event::{Batch, Code};
+use namada_sdk::tx::new_tx_event;
+use namada_sdk::{ibc, proof_of_stake};
+use namada_vote_ext::ethereum_events::MultiSignedEthEvent;
+use namada_vote_ext::ethereum_tx_data_variants;
 
 use super::*;
 use crate::facade::tendermint::abci::types::VoteInfo;
+use crate::facade::tendermint_proto;
+use crate::protocol::{DispatchArgs, DispatchError};
 use crate::shell::stats::InternalStats;
 
 impl<D, H> Shell<D, H>
@@ -52,7 +50,12 @@ where
 
         // Begin the new block and check if a new epoch has begun
         let (height, new_epoch) = self.update_state(req.header);
-        let is_masp_new_epoch = self.state.is_masp_new_epoch(new_epoch)?;
+        let masp_epoch_multiplier =
+            parameters::read_masp_epoch_multiplier_parameter(&self.state)
+                .expect("Must have parameters");
+        let is_masp_new_epoch = self
+            .state
+            .is_masp_new_epoch(new_epoch, masp_epoch_multiplier)?;
 
         let (current_epoch, _gas) = self.state.in_mem().get_current_epoch();
         let update_for_tendermint = matches!(
@@ -221,9 +224,11 @@ where
             .set_header(header)
             .expect("Setting a header shouldn't fail");
 
+        let parameters =
+            parameters::read(&self.state).expect("Must have parameters");
         let new_epoch = self
             .state
-            .update_epoch(height, header_time)
+            .update_epoch(height, header_time, &parameters)
             .expect("Must be able to update epoch");
         (height, new_epoch)
     }
@@ -238,12 +243,11 @@ where
         // Apply validator set update
         response.validator_updates = self
             .get_abci_validator_updates(false, |pk, power| {
-                let pub_key =
-                    crate::facade::tendermint_proto::v0_37::crypto::PublicKey {
-                        sum: Some(key_to_tendermint(&pk).unwrap()),
-                    };
+                let pub_key = tendermint_proto::v0_37::crypto::PublicKey {
+                    sum: Some(key_to_tendermint(&pk).unwrap()),
+                };
                 let pub_key = Some(pub_key);
-                namada::tendermint_proto::v0_37::abci::ValidatorUpdate {
+                tendermint_proto::v0_37::abci::ValidatorUpdate {
                     pub_key,
                     power,
                 }
@@ -283,7 +287,7 @@ where
             );
 
         // PoS inflation
-        namada_proof_of_stake::rewards::apply_inflation(
+        proof_of_stake::rewards::apply_inflation(
             &mut self.state,
             last_epoch,
             num_blocks_in_last_epoch,
@@ -292,7 +296,7 @@ where
         // Pgf inflation
         pgf_inflation::apply_inflation(
             self.state.restrict_writes_to_write_log(),
-            namada::ibc::transfer_over_ibc,
+            ibc::transfer_over_ibc,
         )?;
 
         // Take events that may be emitted from PGF
@@ -333,7 +337,7 @@ where
         &mut self,
         response: &mut shim::response::FinalizeBlock,
         extended_dispatch_result: std::result::Result<
-            namada::tx::data::ExtendedTxResult<protocol::Error>,
+            namada_sdk::tx::data::ExtendedTxResult<protocol::Error>,
             DispatchError,
         >,
         tx_data: TxData<'_>,
@@ -441,7 +445,9 @@ where
     fn handle_inner_tx_results(
         &mut self,
         response: &mut shim::response::FinalizeBlock,
-        extended_tx_result: namada::tx::data::ExtendedTxResult<protocol::Error>,
+        extended_tx_result: namada_sdk::tx::data::ExtendedTxResult<
+            protocol::Error,
+        >,
         tx_data: TxData<'_>,
         tx_logs: &mut TxLogs<'_>,
     ) {
@@ -512,7 +518,9 @@ where
         &mut self,
         response: &mut shim::response::FinalizeBlock,
         msg: &Error,
-        extended_tx_result: namada::tx::data::ExtendedTxResult<protocol::Error>,
+        extended_tx_result: namada_sdk::tx::data::ExtendedTxResult<
+            protocol::Error,
+        >,
         tx_data: TxData<'_>,
         tx_logs: &mut TxLogs<'_>,
     ) {
@@ -902,7 +910,7 @@ struct WrapperCache {
     tx_index: usize,
     gas_meter: TxGasMeter,
     event: Event,
-    extended_tx_result: namada::tx::data::ExtendedTxResult<protocol::Error>,
+    extended_tx_result: namada_sdk::tx::data::ExtendedTxResult<protocol::Error>,
 }
 
 struct TxData<'tx> {
@@ -975,7 +983,7 @@ impl<'finalize> TempTxLogs {
 
     fn check_inner_results(
         &mut self,
-        extended_tx_result: &namada::tx::data::ExtendedTxResult<
+        extended_tx_result: &namada_sdk::tx::data::ExtendedTxResult<
             protocol::Error,
         >,
         tx_index: usize,
@@ -1080,7 +1088,7 @@ struct ReplayProtectionHashes {
 fn pos_votes_from_abci(
     storage: &impl StorageRead,
     votes: &[VoteInfo],
-) -> Vec<namada_proof_of_stake::types::VoteInfo> {
+) -> Vec<proof_of_stake::types::VoteInfo> {
     votes
         .iter()
         .filter_map(
@@ -1116,7 +1124,7 @@ fn pos_votes_from_abci(
                     // Try to convert voting power to u64
                     let validator_vp = u64::from(*power);
 
-                    Some(namada_proof_of_stake::types::VoteInfo {
+                    Some(proof_of_stake::types::VoteInfo {
                         validator_address,
                         validator_vp,
                     })
@@ -1140,63 +1148,66 @@ mod test_finalize_block {
     use std::num::NonZeroU64;
     use std::str::FromStr;
 
-    use namada::core::collections::{HashMap, HashSet};
-    use namada::core::dec::{Dec, POS_DECIMAL_PRECISION};
-    use namada::core::ethereum_events::{EthAddress, Uint as ethUint};
-    use namada::core::hash::Hash;
-    use namada::core::keccak::KeccakHash;
-    use namada::core::key::testing::common_sk_from_simple_seed;
-    use namada::core::storage::KeySeg;
-    use namada::core::time::DurationSecs;
-    use namada::core::uint::Uint;
-    use namada::eth_bridge::storage::bridge_pool::{
+    use namada_replay_protection as replay_protection;
+    use namada_sdk::address;
+    use namada_sdk::collections::{HashMap, HashSet};
+    use namada_sdk::dec::{Dec, POS_DECIMAL_PRECISION};
+    use namada_sdk::eth_bridge::storage::bridge_pool::{
         self, get_key_from_hash, get_nonce_key, get_signed_root_key,
     };
-    use namada::eth_bridge::storage::eth_bridge_queries::is_bridge_comptime_enabled;
-    use namada::eth_bridge::storage::min_confirmations_key;
-    use namada::ethereum_bridge::storage::wrapped_erc20s;
-    use namada::governance::storage::keys::get_proposal_execution_key;
-    use namada::governance::storage::proposal::ProposalType;
-    use namada::governance::{InitProposalData, VoteProposalData};
-    use namada::ledger::gas::VpGasMeter;
-    use namada::ledger::native_vp::parameters::ParametersVp;
-    use namada::ledger::native_vp::NativeVp;
-    use namada::ledger::parameters::EpochDuration;
-    use namada::proof_of_stake::storage::{
+    use namada_sdk::eth_bridge::storage::eth_bridge_queries::is_bridge_comptime_enabled;
+    use namada_sdk::eth_bridge::storage::vote_tallies::BridgePoolRoot;
+    use namada_sdk::eth_bridge::storage::{
+        min_confirmations_key, wrapped_erc20s,
+    };
+    use namada_sdk::eth_bridge::MinimumConfirmations;
+    use namada_sdk::ethereum_events::{EthAddress, Uint as ethUint};
+    use namada_sdk::events::Event;
+    use namada_sdk::gas::VpGasMeter;
+    use namada_sdk::governance::storage::keys::get_proposal_execution_key;
+    use namada_sdk::governance::storage::proposal::ProposalType;
+    use namada_sdk::governance::{
+        InitProposalData, ProposalVote, VoteProposalData,
+    };
+    use namada_sdk::hash::Hash;
+    use namada_sdk::keccak::KeccakHash;
+    use namada_sdk::key::testing::common_sk_from_simple_seed;
+    use namada_sdk::parameters::EpochDuration;
+    use namada_sdk::proof_of_stake::storage::{
         enqueued_slashes_handle, get_num_consensus_validators,
+        liveness_missed_votes_handle, liveness_sum_missed_votes_handle,
+        read_consensus_validator_set_addresses,
         read_consensus_validator_set_addresses_with_stake, read_total_stake,
         read_validator_stake, rewards_accumulator_handle,
         validator_consensus_key_handle, validator_rewards_products_handle,
         validator_slashes_handle, validator_state_handle, write_pos_params,
     };
-    use namada::proof_of_stake::storage_key::{
+    use namada_sdk::proof_of_stake::storage_key::{
         is_validator_slashes_key, slashes_prefix,
     };
-    use namada::proof_of_stake::types::{
+    use namada_sdk::proof_of_stake::types::{
         BondId, SlashType, ValidatorState, WeightedValidator,
     };
-    use namada::proof_of_stake::{unjail_validator, ADDRESS as pos_address};
-    use namada::sdk::events::Event;
-    use namada::tendermint::abci::types::{Misbehavior, MisbehaviorKind};
-    use namada::token::{
+    use namada_sdk::proof_of_stake::{
+        unjail_validator, ADDRESS as pos_address,
+    };
+    use namada_sdk::storage::KeySeg;
+    use namada_sdk::tendermint::abci::types::{Misbehavior, MisbehaviorKind};
+    use namada_sdk::time::DurationSecs;
+    use namada_sdk::token::{
         read_balance, update_balance, Amount, DenominatedAmount,
         NATIVE_MAX_DECIMAL_PLACES,
     };
-    use namada::tx::data::Fee;
-    use namada::tx::event::types::APPLIED as APPLIED_TX;
-    use namada::tx::event::Code as CodeAttr;
-    use namada::tx::{Authorization, Code, Data};
-    use namada::vote_ext::ethereum_events;
-    use namada::{address, replay_protection};
-    use namada_sdk::eth_bridge::storage::vote_tallies::BridgePoolRoot;
-    use namada_sdk::eth_bridge::MinimumConfirmations;
-    use namada_sdk::governance::ProposalVote;
-    use namada_sdk::proof_of_stake::storage::{
-        liveness_missed_votes_handle, liveness_sum_missed_votes_handle,
-        read_consensus_validator_set_addresses,
-    };
+    use namada_sdk::tx::data::Fee;
+    use namada_sdk::tx::event::types::APPLIED as APPLIED_TX;
+    use namada_sdk::tx::event::Code as CodeAttr;
+    use namada_sdk::tx::{Authorization, Code, Data};
+    use namada_sdk::uint::Uint;
+    use namada_sdk::validation::ParametersVp;
     use namada_test_utils::tx_data::TxWriteData;
     use namada_test_utils::TestWasms;
+    use namada_vote_ext::ethereum_events;
+    use namada_vp::native_vp::NativeVp;
     use test_log::test;
 
     use super::*;
@@ -1580,7 +1591,7 @@ mod test_finalize_block {
             return;
         }
         let (mut shell, _, _, _) = setup_at_height(1u64);
-        namada::eth_bridge::test_utils::commit_bridge_pool_root_at_height(
+        namada_sdk::eth_bridge::test_utils::commit_bridge_pool_root_at_height(
             &mut shell.state,
             &KeccakHash([1; 32]),
             1.into(),
@@ -1668,7 +1679,7 @@ mod test_finalize_block {
             }
             // write transfer to storage
             let transfer = {
-                use namada::core::eth_bridge_pool::{
+                use namada_sdk::eth_bridge_pool::{
                     GasFee, PendingTransfer, TransferToEthereum,
                     TransferToEthereumKind,
                 };
@@ -1738,7 +1749,7 @@ mod test_finalize_block {
         let (mut shell, _broadcaster, _, _eth_control) = setup();
 
         let masp_epoch_multiplier =
-            namada::ledger::parameters::read_masp_epoch_multiplier_parameter(
+            namada_sdk::parameters::read_masp_epoch_multiplier_parameter(
                 &shell.state,
             )
             .unwrap();
@@ -1747,10 +1758,20 @@ mod test_finalize_block {
 
         for _ in 1..masp_epoch_multiplier {
             shell.start_new_epoch(None);
-            assert!(!shell.state.is_masp_new_epoch(true).unwrap());
+            assert!(
+                !shell
+                    .state
+                    .is_masp_new_epoch(true, masp_epoch_multiplier)
+                    .unwrap()
+            );
         }
         shell.start_new_epoch(None);
-        assert!(shell.state.is_masp_new_epoch(true).unwrap());
+        assert!(
+            shell
+                .state
+                .is_masp_new_epoch(true, masp_epoch_multiplier)
+                .unwrap()
+        );
     }
 
     /// Test that the finalize block handler never commits changes directly to
@@ -1764,7 +1785,7 @@ mod test_finalize_block {
             min_num_of_blocks: 5,
             min_duration: DurationSecs(0),
         };
-        namada::ledger::parameters::update_epoch_parameter(
+        namada_sdk::parameters::update_epoch_parameter(
             &mut shell.state,
             &epoch_duration,
         )
@@ -1799,7 +1820,7 @@ mod test_finalize_block {
                 r#type: ProposalType::Default,
             };
 
-            namada::governance::init_proposal(
+            namada_sdk::governance::init_proposal(
                 &mut shell.state,
                 &proposal,
                 vec![],
@@ -1814,7 +1835,7 @@ mod test_finalize_block {
             };
             // Vote to accept the proposal (there's only one validator, so its
             // vote decides)
-            namada::governance::vote_proposal(
+            namada_sdk::governance::vote_proposal(
                 &mut shell.state,
                 vote,
                 HashSet::new(),
@@ -1849,15 +1870,12 @@ mod test_finalize_block {
         // Keep applying finalize block
         let validator = shell.mode.get_validator_address().unwrap();
         let pos_params =
-            namada_proof_of_stake::storage::read_pos_params(&shell.state)
-                .unwrap();
+            proof_of_stake::storage::read_pos_params(&shell.state).unwrap();
         let consensus_key =
-            namada_proof_of_stake::storage::validator_consensus_key_handle(
-                validator,
-            )
-            .get(&shell.state, Epoch::default(), &pos_params)
-            .unwrap()
-            .unwrap();
+            proof_of_stake::storage::validator_consensus_key_handle(validator)
+                .get(&shell.state, Epoch::default(), &pos_params)
+                .unwrap()
+                .unwrap();
         let proposer_address = HEXUPPER
             .decode(consensus_key.tm_raw_hash().as_bytes())
             .unwrap();
@@ -2287,7 +2305,7 @@ mod test_finalize_block {
         total_rewards += inflation;
 
         // Query the available rewards
-        let query_rewards = namada_proof_of_stake::query_reward_tokens(
+        let query_rewards = proof_of_stake::query_reward_tokens(
             &shell.state,
             None,
             &validator.address,
@@ -2296,7 +2314,7 @@ mod test_finalize_block {
         .unwrap();
 
         // Claim the rewards from the initial epoch
-        let reward_1 = namada_proof_of_stake::claim_reward_tokens(
+        let reward_1 = proof_of_stake::claim_reward_tokens(
             &mut shell.state,
             None,
             &validator.address,
@@ -2309,7 +2327,7 @@ mod test_finalize_block {
 
         // Query the available rewards again and check that it is 0 now after
         // the claim
-        let query_rewards = namada_proof_of_stake::query_reward_tokens(
+        let query_rewards = proof_of_stake::query_reward_tokens(
             &shell.state,
             None,
             &validator.address,
@@ -2325,7 +2343,7 @@ mod test_finalize_block {
             votes.clone(),
             None,
         );
-        let att = namada_proof_of_stake::claim_reward_tokens(
+        let att = proof_of_stake::claim_reward_tokens(
             &mut shell.state,
             None,
             &validator.address,
@@ -2341,7 +2359,7 @@ mod test_finalize_block {
 
         // Unbond some tokens
         let unbond_amount = token::Amount::native_whole(50_000);
-        let unbond_res = namada_proof_of_stake::unbond_tokens(
+        let unbond_res = proof_of_stake::unbond_tokens(
             &mut shell.state,
             None,
             &validator.address,
@@ -2353,7 +2371,7 @@ mod test_finalize_block {
         assert_eq!(unbond_res.sum, unbond_amount);
 
         // Query the available rewards
-        let query_rewards = namada_proof_of_stake::query_reward_tokens(
+        let query_rewards = proof_of_stake::query_reward_tokens(
             &shell.state,
             None,
             &validator.address,
@@ -2361,7 +2379,7 @@ mod test_finalize_block {
         )
         .unwrap();
 
-        let rew = namada_proof_of_stake::claim_reward_tokens(
+        let rew = proof_of_stake::claim_reward_tokens(
             &mut shell.state,
             None,
             &validator.address,
@@ -2375,13 +2393,13 @@ mod test_finalize_block {
         // Check the bond amounts for rewards up thru the withdrawable epoch
         let withdraw_epoch = current_epoch + params.withdrawable_epoch_offset();
         let last_claim_epoch =
-            namada_proof_of_stake::storage::get_last_reward_claim_epoch(
+            proof_of_stake::storage::get_last_reward_claim_epoch(
                 &shell.state,
                 &validator.address,
                 &validator.address,
             )
             .unwrap();
-        let bond_amounts = namada_proof_of_stake::bond_amounts_for_rewards(
+        let bond_amounts = proof_of_stake::bond_amounts_for_rewards(
             &shell.state,
             &bond_id,
             last_claim_epoch.unwrap_or_default(),
@@ -2421,7 +2439,7 @@ mod test_finalize_block {
         }
 
         // Withdraw tokens
-        let withdraw_amount = namada_proof_of_stake::withdraw_tokens(
+        let withdraw_amount = proof_of_stake::withdraw_tokens(
             &mut shell.state,
             None,
             &validator.address,
@@ -2431,7 +2449,7 @@ mod test_finalize_block {
         assert_eq!(withdraw_amount, unbond_amount);
 
         // Query the available rewards
-        let query_rewards = namada_proof_of_stake::query_reward_tokens(
+        let query_rewards = proof_of_stake::query_reward_tokens(
             &shell.state,
             None,
             &validator.address,
@@ -2440,7 +2458,7 @@ mod test_finalize_block {
         .unwrap();
 
         // Claim tokens
-        let reward_2 = namada_proof_of_stake::claim_reward_tokens(
+        let reward_2 = proof_of_stake::claim_reward_tokens(
             &mut shell.state,
             None,
             &validator.address,
@@ -2462,7 +2480,7 @@ mod test_finalize_block {
         assert!(token_diff < token_uncertainty);
 
         // Query the available rewards to check that they are 0
-        let query_rewards = namada_proof_of_stake::query_reward_tokens(
+        let query_rewards = proof_of_stake::query_reward_tokens(
             &shell.state,
             None,
             &validator.address,
@@ -2494,7 +2512,7 @@ mod test_finalize_block {
 
         let validator = validator_set.pop_first().unwrap();
         let commission_rate =
-            namada_proof_of_stake::storage::validator_commission_rate_handle(
+            proof_of_stake::storage::validator_commission_rate_handle(
                 &validator.address,
             )
             .get(&shell.state, Epoch(0), &params)
@@ -2535,7 +2553,7 @@ mod test_finalize_block {
         let delegator = address::testing::gen_implicit_address();
         let del_amount = init_stake;
         let staking_token = shell.state.in_mem().native_token.clone();
-        namada::token::credit_tokens(
+        namada_sdk::token::credit_tokens(
             &mut shell.state,
             &staking_token,
             &delegator,
@@ -2543,7 +2561,7 @@ mod test_finalize_block {
         )
         .unwrap();
         let mut current_epoch = shell.state.in_mem().block.epoch;
-        namada_proof_of_stake::bond_tokens(
+        proof_of_stake::bond_tokens(
             &mut shell.state,
             Some(&delegator),
             &validator.address,
@@ -2566,7 +2584,7 @@ mod test_finalize_block {
         }
 
         // Claim the rewards for the validator for the first two epochs
-        let val_reward_1 = namada_proof_of_stake::claim_reward_tokens(
+        let val_reward_1 = proof_of_stake::claim_reward_tokens(
             &mut shell.state,
             None,
             &validator.address,
@@ -2592,7 +2610,7 @@ mod test_finalize_block {
         total_rewards += inflation_3;
 
         // Claim again for the validator
-        let val_reward_2 = namada_proof_of_stake::claim_reward_tokens(
+        let val_reward_2 = proof_of_stake::claim_reward_tokens(
             &mut shell.state,
             None,
             &validator.address,
@@ -2601,7 +2619,7 @@ mod test_finalize_block {
         .unwrap();
 
         // Claim for the delegator
-        let del_reward_1 = namada_proof_of_stake::claim_reward_tokens(
+        let del_reward_1 = proof_of_stake::claim_reward_tokens(
             &mut shell.state,
             Some(&delegator),
             &validator.address,
@@ -2660,21 +2678,21 @@ mod test_finalize_block {
 
         // Give the validators some tokens for txs
         let staking_token = shell.state.in_mem().native_token.clone();
-        namada::token::credit_tokens(
+        namada_sdk::token::credit_tokens(
             &mut shell.state,
             &staking_token,
             &validator1.address,
             init_stake,
         )
         .unwrap();
-        namada::token::credit_tokens(
+        namada_sdk::token::credit_tokens(
             &mut shell.state,
             &staking_token,
             &validator2.address,
             init_stake,
         )
         .unwrap();
-        namada::token::credit_tokens(
+        namada_sdk::token::credit_tokens(
             &mut shell.state,
             &staking_token,
             &validator3.address,
@@ -2700,7 +2718,7 @@ mod test_finalize_block {
 
         // Check that there's 3 unique consensus keys
         let consensus_keys =
-            namada_proof_of_stake::storage::get_consensus_key_set(&shell.state)
+            proof_of_stake::storage::get_consensus_key_set(&shell.state)
                 .unwrap();
         assert_eq!(consensus_keys.len(), 3);
         // let ck1 = validator_consensus_key_handle(&validator)
@@ -2714,7 +2732,7 @@ mod test_finalize_block {
 
         // Validator1 bonds 1 NAM
         let bond_amount = token::Amount::native_whole(1);
-        namada_proof_of_stake::bond_tokens(
+        proof_of_stake::bond_tokens(
             &mut shell.state,
             None,
             &validator1.address,
@@ -2726,7 +2744,7 @@ mod test_finalize_block {
 
         // Validator2 changes consensus key
         let new_ck2 = common_sk_from_simple_seed(1).ref_to();
-        namada_proof_of_stake::change_consensus_key(
+        proof_of_stake::change_consensus_key(
             &mut shell.state,
             &validator2.address,
             &new_ck2,
@@ -2735,7 +2753,7 @@ mod test_finalize_block {
         .unwrap();
 
         // Validator3 bonds 1 NAM and changes consensus key
-        namada_proof_of_stake::bond_tokens(
+        proof_of_stake::bond_tokens(
             &mut shell.state,
             None,
             &validator3.address,
@@ -2745,7 +2763,7 @@ mod test_finalize_block {
         )
         .unwrap();
         let new_ck3 = common_sk_from_simple_seed(2).ref_to();
-        namada_proof_of_stake::change_consensus_key(
+        proof_of_stake::change_consensus_key(
             &mut shell.state,
             &validator3.address,
             &new_ck3,
@@ -2755,7 +2773,7 @@ mod test_finalize_block {
 
         // Check that there's 5 unique consensus keys
         let consensus_keys =
-            namada_proof_of_stake::storage::get_consensus_key_set(&shell.state)
+            proof_of_stake::storage::get_consensus_key_set(&shell.state)
                 .unwrap();
         assert_eq!(consensus_keys.len(), 5);
 
@@ -2795,7 +2813,7 @@ mod test_finalize_block {
 
         // Val 1 changes consensus key
         let new_ck1 = common_sk_from_simple_seed(3).ref_to();
-        namada_proof_of_stake::change_consensus_key(
+        proof_of_stake::change_consensus_key(
             &mut shell.state,
             &validator1.address,
             &new_ck1,
@@ -2804,7 +2822,7 @@ mod test_finalize_block {
         .unwrap();
 
         // Val 2 is fully unbonded
-        namada_proof_of_stake::unbond_tokens(
+        proof_of_stake::unbond_tokens(
             &mut shell.state,
             None,
             &validator2.address,
@@ -2815,7 +2833,7 @@ mod test_finalize_block {
         .unwrap();
 
         // Val 3 is fully unbonded and changes consensus key
-        namada_proof_of_stake::unbond_tokens(
+        proof_of_stake::unbond_tokens(
             &mut shell.state,
             None,
             &validator3.address,
@@ -2825,7 +2843,7 @@ mod test_finalize_block {
         )
         .unwrap();
         let new2_ck3 = common_sk_from_simple_seed(4).ref_to();
-        namada_proof_of_stake::change_consensus_key(
+        proof_of_stake::change_consensus_key(
             &mut shell.state,
             &validator1.address,
             &new2_ck3,
@@ -2835,7 +2853,7 @@ mod test_finalize_block {
 
         // Check that there's 7 unique consensus keys
         let consensus_keys =
-            namada_proof_of_stake::storage::get_consensus_key_set(&shell.state)
+            proof_of_stake::storage::get_consensus_key_set(&shell.state)
                 .unwrap();
         assert_eq!(consensus_keys.len(), 7);
 
@@ -2867,7 +2885,7 @@ mod test_finalize_block {
         // set, along with consensus key changes
 
         // Val2 bonds 1 NAM and changes consensus key
-        namada_proof_of_stake::bond_tokens(
+        proof_of_stake::bond_tokens(
             &mut shell.state,
             None,
             &validator2.address,
@@ -2877,7 +2895,7 @@ mod test_finalize_block {
         )
         .unwrap();
         let new2_ck2 = common_sk_from_simple_seed(5).ref_to();
-        namada_proof_of_stake::change_consensus_key(
+        proof_of_stake::change_consensus_key(
             &mut shell.state,
             &validator2.address,
             &new2_ck2,
@@ -2886,7 +2904,7 @@ mod test_finalize_block {
         .unwrap();
 
         // Val3 bonds 1 NAM
-        namada_proof_of_stake::bond_tokens(
+        proof_of_stake::bond_tokens(
             &mut shell.state,
             None,
             &validator3.address,
@@ -2898,7 +2916,7 @@ mod test_finalize_block {
 
         // Check that there's 8 unique consensus keys
         let consensus_keys =
-            namada_proof_of_stake::storage::get_consensus_key_set(&shell.state)
+            proof_of_stake::storage::get_consensus_key_set(&shell.state)
                 .unwrap();
         assert_eq!(consensus_keys.len(), 8);
 
@@ -3026,9 +3044,10 @@ mod test_finalize_block {
     fn test_masp_anchors_merklized() {
         let (mut shell, _, _, _) = setup();
 
-        let convert_key = namada::token::storage_key::masp_convert_anchor_key();
+        let convert_key =
+            namada_sdk::token::storage_key::masp_convert_anchor_key();
         let commitment_key =
-            namada::token::storage_key::masp_commitment_anchor_key(0);
+            namada_sdk::token::storage_key::masp_commitment_anchor_key(0);
 
         // merkle tree root before finalize_block
         let root_pre = shell.shell.state.in_mem().block.tree.root();
@@ -3626,13 +3645,13 @@ mod test_finalize_block {
 
         let fee_amount =
             wrapper.header().wrapper().unwrap().get_tx_fee().unwrap();
-        let fee_amount = namada::token::denom_to_amount(
+        let fee_amount = namada_sdk::token::denom_to_amount(
             fee_amount,
             &wrapper.header().wrapper().unwrap().fee.token,
             &shell.state,
         )
         .unwrap();
-        let signer_balance = namada::token::read_balance(
+        let signer_balance = namada_sdk::token::read_balance(
             &shell.state,
             &shell.state.in_mem().native_token,
             &wrapper.header().wrapper().unwrap().fee_payer(),
@@ -3668,7 +3687,7 @@ mod test_finalize_block {
             .unwrap();
         assert!(inner_result.is_err());
 
-        let new_signer_balance = namada::token::read_balance(
+        let new_signer_balance = namada_sdk::token::read_balance(
             &shell.state,
             &shell.state.in_mem().native_token,
             &wrapper.header().wrapper().unwrap().fee_payer(),
@@ -3690,7 +3709,7 @@ mod test_finalize_block {
 
         // Credit some tokens for fee payment
         let initial_balance: token::Amount = 1.into();
-        namada::token::credit_tokens(
+        namada_sdk::token::credit_tokens(
             &mut shell.state,
             &native_token,
             &Address::from(&keypair.to_public()),
@@ -3712,7 +3731,7 @@ mod test_finalize_block {
         // payer
         let fee_amount =
             batch.header().wrapper().unwrap().get_tx_fee().unwrap();
-        let fee_amount = namada::token::denom_to_amount(
+        let fee_amount = namada_sdk::token::denom_to_amount(
             fee_amount,
             &batch.header().wrapper().unwrap().fee.token,
             &shell.state,
@@ -3758,20 +3777,17 @@ mod test_finalize_block {
 
         let validator = shell.mode.get_validator_address().unwrap().to_owned();
         let pos_params =
-            namada_proof_of_stake::storage::read_pos_params(&shell.state)
-                .unwrap();
+            proof_of_stake::storage::read_pos_params(&shell.state).unwrap();
         let consensus_key =
-            namada_proof_of_stake::storage::validator_consensus_key_handle(
-                &validator,
-            )
-            .get(&shell.state, Epoch::default(), &pos_params)
-            .unwrap()
-            .unwrap();
+            proof_of_stake::storage::validator_consensus_key_handle(&validator)
+                .get(&shell.state, Epoch::default(), &pos_params)
+                .unwrap()
+                .unwrap();
         let proposer_address = HEXUPPER
             .decode(consensus_key.tm_raw_hash().as_bytes())
             .unwrap();
 
-        let proposer_balance = namada::token::read_balance(
+        let proposer_balance = namada_sdk::token::read_balance(
             &shell.state,
             &shell.state.in_mem().native_token,
             &validator,
@@ -3803,14 +3819,14 @@ mod test_finalize_block {
         )));
         let fee_amount =
             wrapper.header().wrapper().unwrap().get_tx_fee().unwrap();
-        let fee_amount = namada::token::denom_to_amount(
+        let fee_amount = namada_sdk::token::denom_to_amount(
             fee_amount,
             &wrapper.header().wrapper().unwrap().fee.token,
             &shell.state,
         )
         .unwrap();
 
-        let signer_balance = namada::token::read_balance(
+        let signer_balance = namada_sdk::token::read_balance(
             &shell.state,
             &shell.state.in_mem().native_token,
             &wrapper.header().wrapper().unwrap().fee_payer(),
@@ -3838,7 +3854,7 @@ mod test_finalize_block {
         let code = event.read_attribute::<CodeAttr>().expect("Test failed");
         assert_eq!(code, ResultCode::Ok);
 
-        let new_proposer_balance = namada::token::read_balance(
+        let new_proposer_balance = namada_sdk::token::read_balance(
             &shell.state,
             &shell.state.in_mem().native_token,
             &validator,
@@ -3849,7 +3865,7 @@ mod test_finalize_block {
             proposer_balance.checked_add(fee_amount).unwrap()
         );
 
-        let new_signer_balance = namada::token::read_balance(
+        let new_signer_balance = namada_sdk::token::read_balance(
             &shell.state,
             &shell.state.in_mem().native_token,
             &wrapper.header().wrapper().unwrap().fee_payer(),
@@ -3862,7 +3878,7 @@ mod test_finalize_block {
     }
 
     #[test]
-    fn test_ledger_slashing() -> namada::state::StorageResult<()> {
+    fn test_ledger_slashing() -> namada_sdk::state::StorageResult<()> {
         let num_validators = 7_u64;
         let (mut shell, _recv, _, _) = setup_with_cfg(SetupCfg {
             last_height: 0,
@@ -4068,13 +4084,15 @@ mod test_finalize_block {
             }
         }
 
-        let num_slashes =
-            namada::state::iter_prefix_bytes(&shell.state, &slashes_prefix())?
-                .filter(|kv_res| {
-                    let (k, _v) = kv_res.as_ref().unwrap();
-                    is_validator_slashes_key(k).is_some()
-                })
-                .count();
+        let num_slashes = namada_sdk::state::iter_prefix_bytes(
+            &shell.state,
+            &slashes_prefix(),
+        )?
+        .filter(|kv_res| {
+            let (k, _v) = kv_res.as_ref().unwrap();
+            is_validator_slashes_key(k).is_some()
+        })
+        .count();
 
         assert_eq!(num_slashes, 2);
         assert_eq!(
@@ -4230,7 +4248,7 @@ mod test_finalize_block {
     /// NOTE: must call `get_default_true_votes` before every call to
     /// `next_block_for_inflation`
     #[test]
-    fn test_multiple_misbehaviors() -> namada::state::StorageResult<()> {
+    fn test_multiple_misbehaviors() -> namada_sdk::state::StorageResult<()> {
         for num_validators in &[4_u64, 6_u64, 9_u64] {
             tracing::debug!("\nNUM VALIDATORS = {}", num_validators);
             test_multiple_misbehaviors_by_num_vals(*num_validators)?;
@@ -4250,7 +4268,7 @@ mod test_finalize_block {
     /// 7) Discover misbehavior in epoch 4
     fn test_multiple_misbehaviors_by_num_vals(
         num_validators: u64,
-    ) -> namada::state::StorageResult<()> {
+    ) -> namada_sdk::state::StorageResult<()> {
         // Setup the network with pipeline_len = 2, unbonding_len = 4
         // let num_validators = 8_u64;
         let (mut shell, _recv, _, _) = setup_with_cfg(SetupCfg {
@@ -4268,7 +4286,7 @@ mod test_finalize_block {
         let slash_pool_balance_init = read_balance(
             &shell.state,
             &nam_address,
-            &namada_proof_of_stake::SLASH_POOL_ADDRESS,
+            &proof_of_stake::SLASH_POOL_ADDRESS,
         )
         .unwrap();
         debug_assert_eq!(slash_pool_balance_init, token::Amount::zero());
@@ -4309,14 +4327,14 @@ mod test_finalize_block {
         let delegator = address::testing::gen_implicit_address();
         let del_1_amount = token::Amount::native_whole(37_231);
         let staking_token = shell.state.in_mem().native_token.clone();
-        namada::token::credit_tokens(
+        namada_sdk::token::credit_tokens(
             &mut shell.state,
             &staking_token,
             &delegator,
             token::Amount::native_whole(200_000),
         )
         .unwrap();
-        namada_proof_of_stake::bond_tokens(
+        proof_of_stake::bond_tokens(
             &mut shell.state,
             Some(&delegator),
             &val1.address,
@@ -4328,7 +4346,7 @@ mod test_finalize_block {
 
         // Self-unbond
         let self_unbond_1_amount = token::Amount::native_whole(84_654);
-        namada_proof_of_stake::unbond_tokens(
+        proof_of_stake::unbond_tokens(
             &mut shell.state,
             None,
             &val1.address,
@@ -4338,7 +4356,7 @@ mod test_finalize_block {
         )
         .unwrap();
 
-        let val_stake = namada_proof_of_stake::storage::read_validator_stake(
+        let val_stake = proof_of_stake::storage::read_validator_stake(
             &shell.state,
             &params,
             &val1.address,
@@ -4346,7 +4364,7 @@ mod test_finalize_block {
         )
         .unwrap();
 
-        let total_stake = namada_proof_of_stake::storage::read_total_stake(
+        let total_stake = proof_of_stake::storage::read_total_stake(
             &shell.state,
             &params,
             current_epoch + params.pipeline_len,
@@ -4371,7 +4389,7 @@ mod test_finalize_block {
         let (current_epoch, _) = advance_epoch(&mut shell, &pkh1, &votes, None);
         tracing::debug!("\nUnbonding in epoch 2");
         let del_unbond_1_amount = token::Amount::native_whole(18_000);
-        namada_proof_of_stake::unbond_tokens(
+        proof_of_stake::unbond_tokens(
             &mut shell.state,
             Some(&delegator),
             &val1.address,
@@ -4381,14 +4399,14 @@ mod test_finalize_block {
         )
         .unwrap();
 
-        let val_stake = namada_proof_of_stake::storage::read_validator_stake(
+        let val_stake = proof_of_stake::storage::read_validator_stake(
             &shell.state,
             &params,
             &val1.address,
             current_epoch + params.pipeline_len,
         )
         .unwrap();
-        let total_stake = namada_proof_of_stake::storage::read_total_stake(
+        let total_stake = proof_of_stake::storage::read_total_stake(
             &shell.state,
             &params,
             current_epoch + params.pipeline_len,
@@ -4417,7 +4435,7 @@ mod test_finalize_block {
         tracing::debug!("\nBonding in epoch 3");
 
         let self_bond_1_amount = token::Amount::native_whole(9_123);
-        namada_proof_of_stake::bond_tokens(
+        proof_of_stake::bond_tokens(
             &mut shell.state,
             None,
             &val1.address,
@@ -4437,7 +4455,7 @@ mod test_finalize_block {
         assert_eq!(current_epoch.0, 4_u64);
 
         let self_unbond_2_amount = token::Amount::native_whole(15_000);
-        namada_proof_of_stake::unbond_tokens(
+        proof_of_stake::unbond_tokens(
             &mut shell.state,
             None,
             &val1.address,
@@ -4459,7 +4477,7 @@ mod test_finalize_block {
 
         // Delegate
         let del_2_amount = token::Amount::native_whole(8_144);
-        namada_proof_of_stake::bond_tokens(
+        proof_of_stake::bond_tokens(
             &mut shell.state,
             Some(&delegator),
             &val1.address,
@@ -4522,18 +4540,16 @@ mod test_finalize_block {
         assert_eq!(enqueued_slash.r#type, SlashType::DuplicateVote);
         assert_eq!(enqueued_slash.rate, Dec::zero());
         let last_slash =
-            namada_proof_of_stake::storage::read_validator_last_slash_epoch(
+            proof_of_stake::storage::read_validator_last_slash_epoch(
                 &shell.state,
                 &val1.address,
             )
             .unwrap();
         assert_eq!(last_slash, Some(misbehavior_epoch));
         assert!(
-            namada_proof_of_stake::storage::validator_slashes_handle(
-                &val1.address
-            )
-            .is_empty(&shell.state)
-            .unwrap()
+            proof_of_stake::storage::validator_slashes_handle(&val1.address)
+                .is_empty(&shell.state)
+                .unwrap()
         );
 
         tracing::debug!("Advancing to epoch 7");
@@ -4593,14 +4609,14 @@ mod test_finalize_block {
         assert_eq!(num_enqueued_8, 2);
         assert_eq!(num_enqueued_9, 1);
         let last_slash =
-            namada_proof_of_stake::storage::read_validator_last_slash_epoch(
+            proof_of_stake::storage::read_validator_last_slash_epoch(
                 &shell.state,
                 &val1.address,
             )
             .unwrap();
         assert_eq!(last_slash, Some(Epoch(4)));
         assert!(
-            namada_proof_of_stake::is_validator_frozen(
+            proof_of_stake::is_validator_frozen(
                 &shell.state,
                 &val1.address,
                 current_epoch,
@@ -4609,21 +4625,18 @@ mod test_finalize_block {
             .unwrap()
         );
         assert!(
-            namada_proof_of_stake::storage::validator_slashes_handle(
-                &val1.address
-            )
-            .is_empty(&shell.state)
-            .unwrap()
+            proof_of_stake::storage::validator_slashes_handle(&val1.address)
+                .is_empty(&shell.state)
+                .unwrap()
         );
 
-        let pre_stake_10 =
-            namada_proof_of_stake::storage::read_validator_stake(
-                &shell.state,
-                &params,
-                &val1.address,
-                Epoch(10),
-            )
-            .unwrap();
+        let pre_stake_10 = proof_of_stake::storage::read_validator_stake(
+            &shell.state,
+            &params,
+            &val1.address,
+            Epoch(10),
+        )
+        .unwrap();
         assert_eq!(
             pre_stake_10,
             initial_stake + del_1_amount
@@ -4650,14 +4663,14 @@ mod test_finalize_block {
         let (current_epoch, _) = advance_epoch(&mut shell, &pkh1, &votes, None);
         assert_eq!(current_epoch.0, 9_u64);
 
-        let val_stake_3 = namada_proof_of_stake::storage::read_validator_stake(
+        let val_stake_3 = proof_of_stake::storage::read_validator_stake(
             &shell.state,
             &params,
             &val1.address,
             Epoch(3),
         )
         .unwrap();
-        let val_stake_4 = namada_proof_of_stake::storage::read_validator_stake(
+        let val_stake_4 = proof_of_stake::storage::read_validator_stake(
             &shell.state,
             &params,
             &val1.address,
@@ -4665,13 +4678,13 @@ mod test_finalize_block {
         )
         .unwrap();
 
-        let tot_stake_3 = namada_proof_of_stake::storage::read_total_stake(
+        let tot_stake_3 = proof_of_stake::storage::read_total_stake(
             &shell.state,
             &params,
             Epoch(3),
         )
         .unwrap();
-        let tot_stake_4 = namada_proof_of_stake::storage::read_total_stake(
+        let tot_stake_4 = proof_of_stake::storage::read_total_stake(
             &shell.state,
             &params,
             Epoch(4),
@@ -4697,9 +4710,7 @@ mod test_finalize_block {
         // There should be 2 slashes processed for the validator, each with rate
         // equal to the cubic slashing rate
         let val_slashes =
-            namada_proof_of_stake::storage::validator_slashes_handle(
-                &val1.address,
-            );
+            proof_of_stake::storage::validator_slashes_handle(&val1.address);
         assert_eq!(val_slashes.len(&shell.state).unwrap(), 2u64);
         let is_rate_good = val_slashes
             .iter(&shell.state)
@@ -4882,7 +4893,7 @@ mod test_finalize_block {
         assert_eq!(current_epoch.0, 12_u64);
 
         tracing::debug!("\nCHECK BOND AND UNBOND DETAILS");
-        let details = namada_proof_of_stake::queries::bonds_and_unbonds(
+        let details = proof_of_stake::queries::bonds_and_unbonds(
             &shell.state,
             None,
             None,
@@ -5001,7 +5012,7 @@ mod test_finalize_block {
         // let slash_pool_balance_pre_withdraw = slash_pool_balance;
         // Withdraw the delegation unbonds, which total to 18_000. This should
         // only be affected by the slashes in epoch 3
-        let del_withdraw = namada_proof_of_stake::withdraw_tokens(
+        let del_withdraw = proof_of_stake::withdraw_tokens(
             &mut shell.state,
             Some(&delegator),
             &val1.address,
@@ -5034,7 +5045,7 @@ mod test_finalize_block {
         // println!("\nWITHDRAWING SELF UNBOND");
         // Withdraw the self unbonds, which total 154_654 + 15_000 - 9_123. Only
         // the (15_000 - 9_123) tokens are slashable.
-        // let self_withdraw = namada_proof_of_stake::withdraw_tokens(
+        // let self_withdraw = proof_of_stake::withdraw_tokens(
         //     &mut shell.state,
         //     None,
         //     &val1.address,
@@ -5070,8 +5081,8 @@ mod test_finalize_block {
     }
 
     #[test]
-    fn test_jail_validator_for_inactivity() -> namada::state::StorageResult<()>
-    {
+    fn test_jail_validator_for_inactivity()
+    -> namada_sdk::state::StorageResult<()> {
         let num_validators = 5_u64;
         let (mut shell, _recv, _, _) = setup_with_cfg(SetupCfg {
             last_height: 0,
@@ -5103,14 +5114,13 @@ mod test_finalize_block {
             Epoch::default(),
         );
 
-        let validator_stake =
-            namada_proof_of_stake::storage::read_validator_stake(
-                &shell.state,
-                &params,
-                &val2,
-                Epoch::default(),
-            )
-            .unwrap();
+        let validator_stake = proof_of_stake::storage::read_validator_stake(
+            &shell.state,
+            &params,
+            &val2,
+            Epoch::default(),
+        )
+        .unwrap();
 
         let val3 = initial_consensus_set[2].clone();
         let val4 = initial_consensus_set[3].clone();
@@ -5152,7 +5162,7 @@ mod test_finalize_block {
         // Completely unbond one of the validator to test the pruning at the
         // pipeline epoch
         let mut current_epoch = shell.state.in_mem().block.epoch;
-        namada_proof_of_stake::unbond_tokens(
+        proof_of_stake::unbond_tokens(
             &mut shell.state,
             None,
             &val5,
@@ -5355,7 +5365,7 @@ mod test_finalize_block {
         }
 
         // Validator 2 unjail itself
-        namada_proof_of_stake::unjail_validator(
+        proof_of_stake::unjail_validator(
             &mut shell.state,
             &val2,
             current_epoch,
@@ -5422,8 +5432,7 @@ mod test_finalize_block {
         misbehaviors: Option<Vec<Misbehavior>>,
     ) -> (Epoch, token::Amount) {
         let current_epoch = shell.state.in_mem().block.epoch;
-        let staking_token =
-            namada_proof_of_stake::staking_token_address(&shell.state);
+        let staking_token = proof_of_stake::staking_token_address(&shell.state);
 
         // NOTE: assumed that the only change in pos address balance by
         // advancing to the next epoch is minted inflation - no change occurs
@@ -5480,7 +5489,7 @@ mod test_finalize_block {
         let keys_changed = BTreeSet::from([min_confirmations_key()]);
         let verifiers = BTreeSet::default();
         let batched_tx = tx.batch_ref_first_tx().unwrap();
-        let ctx = namada::ledger::native_vp::Ctx::new(
+        let ctx = namada_vp::native_vp::Ctx::new(
             shell.mode.get_validator_address().expect("Test failed"),
             shell.state.read_only(),
             batched_tx.tx,
@@ -5491,7 +5500,7 @@ mod test_finalize_block {
             &verifiers,
             shell.vp_wasm_cache.clone(),
         );
-        let parameters = ParametersVp { ctx };
+        let parameters = ParametersVp::new(ctx);
         assert!(
             parameters
                 .validate_tx(&batched_tx, &keys_changed, &verifiers)
@@ -5502,7 +5511,7 @@ mod test_finalize_block {
         let mut req = FinalizeBlock::default();
         req.header.time = {
             #[allow(clippy::disallowed_methods)]
-            namada::core::time::DateTimeUtc::now()
+            namada_sdk::time::DateTimeUtc::now()
         };
         let current_decision_height = shell.get_current_decision_height();
         if let Some(b) = shell.state.in_mem_mut().last_block.as_mut() {
