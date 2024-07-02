@@ -216,11 +216,9 @@ impl<S> namada_systems::ibc::Read<S> for Store<S>
 where
     S: StorageRead,
 {
-    type Err = namada_storage::Error;
-
     fn try_extract_masp_tx_from_envelope(
         tx_data: &[u8],
-    ) -> Result<Option<masp_primitives::transaction::Transaction>, Self::Err>
+    ) -> namada_storage::Result<Option<masp_primitives::transaction::Transaction>>
     {
         let msg = decode_message(tx_data).into_storage_result().ok();
         let tx = if let Some(IbcMessage::Envelope(ref envelope)) = msg {
@@ -240,7 +238,7 @@ where
         tx_data: &[u8],
         mut accum: ChangedBalances,
         keys_changed: &BTreeSet<namada_core::storage::Key>,
-    ) -> Result<ChangedBalances, Self::Err> {
+    ) -> namada_storage::Result<ChangedBalances> {
         let msg = decode_message(tx_data).into_storage_result().ok();
         match msg {
             None => {}
