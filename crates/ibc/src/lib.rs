@@ -86,7 +86,6 @@ use namada_core::ibc::apps::nft_transfer::types::packet::PacketData as NftPacket
 use namada_core::ibc::core::channel::types::commitment::{
     compute_packet_commitment, AcknowledgementCommitment, PacketCommitment,
 };
-use namada_core::ibc::ChangedBalances;
 use namada_core::masp::{addr_taddr, ibc_taddr, TAddrData};
 use namada_core::token::Amount;
 use namada_events::EmitEvents;
@@ -94,6 +93,7 @@ use namada_state::{
     DBIter, Key, ResultExt, State, StorageError, StorageHasher, StorageRead,
     StorageWrite, WlState, DB,
 };
+use namada_systems::ibc::ChangedBalances;
 use namada_token::transaction::components::ValueSum;
 use namada_token::Transfer;
 pub use nft::*;
@@ -212,7 +212,7 @@ impl TryFrom<IbcMsgNftTransfer> for IbcTransferInfo {
 #[derive(Debug)]
 pub struct Store<S>(PhantomData<S>);
 
-impl<S> namada_core::ibc::Read<S> for Store<S>
+impl<S> namada_systems::ibc::Read<S> for Store<S>
 where
     S: StorageRead,
 {

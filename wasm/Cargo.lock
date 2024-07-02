@@ -3759,6 +3759,7 @@ dependencies = [
  "namada_proof_of_stake",
  "namada_state",
  "namada_storage",
+ "namada_systems",
  "namada_trans_token",
  "namada_tx",
  "namada_vote_ext",
@@ -3807,6 +3808,7 @@ dependencies = [
  "namada_macros",
  "namada_parameters",
  "namada_state",
+ "namada_systems",
  "namada_trans_token",
  "namada_tx",
  "namada_vp",
@@ -3838,6 +3840,7 @@ dependencies = [
  "namada_parameters",
  "namada_state",
  "namada_storage",
+ "namada_systems",
  "namada_token",
  "namada_tx",
  "namada_vp",
@@ -3885,6 +3888,7 @@ dependencies = [
  "namada_macros",
  "namada_state",
  "namada_storage",
+ "namada_systems",
  "namada_tx",
  "namada_vp",
  "smooth-operator",
@@ -3907,6 +3911,7 @@ dependencies = [
  "namada_parameters",
  "namada_state",
  "namada_storage",
+ "namada_systems",
  "namada_trans_token",
  "namada_tx",
  "namada_vp",
@@ -4007,6 +4012,7 @@ dependencies = [
  "namada_parameters",
  "namada_state",
  "namada_storage",
+ "namada_systems",
  "namada_trans_token",
  "namada_tx",
  "namada_vp",
@@ -4033,6 +4039,7 @@ dependencies = [
  "namada_merkle_tree",
  "namada_replay_protection",
  "namada_storage",
+ "namada_systems",
  "namada_tx",
  "patricia_tree",
  "proptest",
@@ -4056,6 +4063,14 @@ dependencies = [
  "smooth-operator",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "namada_systems"
+version = "0.40.0"
+dependencies = [
+ "namada_core",
+ "namada_storage",
 ]
 
 [[package]]
@@ -4120,6 +4135,7 @@ dependencies = [
  "namada_events",
  "namada_state",
  "namada_storage",
+ "namada_systems",
  "namada_tx",
  "namada_vp",
  "thiserror",
