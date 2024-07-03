@@ -1,36 +1,35 @@
 //! PGF lib code.
 
 use namada_core::address::Address;
-use namada_parameters::storage as params_storage;
 use namada_state::{StorageRead, StorageResult, StorageWrite};
-use namada_trans_token::{credit_tokens, get_effective_total_native_supply};
+use namada_systems::{parameters, trans_token};
 
 use crate::pgf::storage::{get_parameters, get_payments, get_stewards};
 use crate::storage::proposal::{PGFIbcTarget, PGFTarget};
 
 /// Apply the PGF inflation.
-pub fn apply_inflation<S, F>(
+pub fn apply_inflation<S, Params, TransToken, F>(
     storage: &mut S,
     transfer_over_ibc: F,
 ) -> StorageResult<()>
 where
     S: StorageWrite + StorageRead,
+    Params: parameters::Read<S>,
+    TransToken: trans_token::Read<S> + trans_token::Write<S>,
     F: Fn(&mut S, &Address, &Address, &PGFIbcTarget) -> StorageResult<()>,
 {
     let pgf_parameters = get_parameters(storage)?;
     let staking_token = storage.get_native_token()?;
 
-    let epochs_per_year: u64 = storage
-        .read(&params_storage::get_epochs_per_year_key())?
-        .expect("Epochs per year should exist in storage");
-    let total_supply = get_effective_total_native_supply(storage)?;
+    let epochs_per_year = Params::epochs_per_year(storage)?;
+    let total_supply = TransToken::get_effective_total_native_supply(storage)?;
 
     let pgf_inflation_amount = total_supply
         .mul_floor(pgf_parameters.pgf_inflation_rate)?
         .checked_div_u64(epochs_per_year)
         .unwrap_or_default();
 
-    credit_tokens(
+    TransToken::credit_tokens(
         storage,
         &staking_token,
         &super::ADDRESS,
@@ -50,7 +49,7 @@ where
 
     for funding in pgf_fundings {
         let result = match &funding.detail {
-            PGFTarget::Internal(target) => namada_trans_token::transfer(
+            PGFTarget::Internal(target) => TransToken::transfer(
                 storage,
                 &staking_token,
                 &super::ADDRESS,
@@ -94,7 +93,7 @@ where
             let pgf_steward_reward =
                 pgf_steward_inflation.mul_floor(percentage)?;
 
-            if credit_tokens(
+            if TransToken::credit_tokens(
                 storage,
                 &staking_token,
                 &address,
