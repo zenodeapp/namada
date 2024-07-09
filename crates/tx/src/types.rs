@@ -1740,6 +1740,7 @@ impl<'tx> Tx {
 /// index inside that block
 #[derive(
     Debug,
+    Copy,
     Clone,
     BorshSerialize,
     BorshDeserialize,

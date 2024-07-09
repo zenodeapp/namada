@@ -23,7 +23,7 @@ pub async fn syncing<
     IO: Io + Send + Sync,
 >(
     mut shielded: ShieldedContext<U>,
-    client: &C,
+    client: C,
     indexer_addr: Option<&str>,
     io: &IO,
     start_query_height: Option<BlockHeight>,

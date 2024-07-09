@@ -1,6 +1,7 @@
 //! Helper functions and types
 
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::{Arc, Mutex};
 
 use borsh::BorshDeserialize;
@@ -10,12 +11,11 @@ use namada_core::collections::HashMap;
 use namada_core::storage::{BlockHeight, TxIndex};
 use namada_tx::{IndexedTx, Tx};
 
-use crate::control_flow::ShutdownSignal;
 use crate::error::{Error, QueryError};
 use crate::io::Io;
 use crate::masp::{
     extract_masp_tx, extract_masp_tx_from_ibc_message,
-    get_indexed_masp_events_at_height, IndexedNoteEntry, Unscanned,
+    get_indexed_masp_events_at_height, IndexedNoteEntry,
 };
 use crate::queries::Client;
 
@@ -90,43 +90,36 @@ impl MaspClientCapabilities {
 /// of how shielded-sync fetches the necessary data
 /// from a remote server.
 // TODO: redesign this api with progress bars in mind
-pub trait MaspClient {
+#[async_trait::async_trait]
+pub trait MaspClient: Clone {
     /// Return the last block height we can retrieve data from.
-    #[allow(async_fn_in_trait)]
     async fn last_block_height(&self) -> Result<Option<BlockHeight>, Error>;
 
     /// Fetch shielded transfers from blocks heights in the range `[from, to]`,
     /// keeping track of progress through `progress`. The fetched transfers
     /// are sent over to a separate worker through `tx_sender`.
-    #[allow(async_fn_in_trait)]
-    async fn fetch_shielded_transfers<IO: Io>(
+    async fn fetch_shielded_transfers(
         &self,
-        progress: &impl ProgressTracker<IO>,
-        shutdown_signal: &mut ShutdownSignal,
-        tx_sender: FetchQueueSender,
         from: BlockHeight,
         to: BlockHeight,
-    ) -> Result<(), Error>;
+    ) -> Result<BlockRange, Error>;
 
     /// Return the capabilities of this client.
     fn capabilities(&self) -> MaspClientCapabilities;
 
     /// Fetch the commitment tree of height `height`.
-    #[allow(async_fn_in_trait)]
     async fn fetch_commitment_tree(
         &self,
         height: BlockHeight,
     ) -> Result<CommitmentTree<Node>, Error>;
 
     /// Fetch the tx notes map of height `height`.
-    #[allow(async_fn_in_trait)]
     async fn fetch_tx_notes_map(
         &self,
         height: BlockHeight,
     ) -> Result<BTreeMap<IndexedTx, usize>, Error>;
 
     /// Fetch the witness map of height `height`.
-    #[allow(async_fn_in_trait)]
     async fn fetch_witness_map(
         &self,
         height: BlockHeight,
@@ -136,53 +129,56 @@ pub trait MaspClient {
 /// An inefficient MASP client which simply uses a
 /// client to the blockchain to query it directly.
 #[cfg(not(target_family = "wasm"))]
-pub struct LedgerMaspClient<'client, C> {
-    client: &'client C,
+pub struct LedgerMaspClient<C> {
+    client: Arc<C>,
 }
 
-#[cfg(not(target_family = "wasm"))]
-impl<'client, C> LedgerMaspClient<'client, C> {
-    /// Create a new [`MaspClient`] given an rpc client.
-    pub const fn new(client: &'client C) -> Self {
-        Self { client }
+impl<C> Clone for LedgerMaspClient<C> {
+    fn clone(&self) -> Self {
+        Self {
+            client: Arc::clone(&self.client),
+        }
     }
 }
 
 #[cfg(not(target_family = "wasm"))]
-impl<C: Client + Sync> MaspClient for LedgerMaspClient<'_, C> {
+impl<C> LedgerMaspClient<C> {
+    /// Create a new [`MaspClient`] given an rpc client.
+    #[inline(always)]
+    pub fn new(client: C) -> Self {
+        Self {
+            client: Arc::new(client),
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[async_trait::async_trait]
+impl<C: Client + Send + Sync> MaspClient for LedgerMaspClient<C> {
     async fn last_block_height(&self) -> Result<Option<BlockHeight>, Error> {
-        let maybe_block = crate::rpc::query_block(self.client).await?;
+        let maybe_block = crate::rpc::query_block(&*self.client).await?;
         Ok(maybe_block.map(|b| b.height))
     }
 
-    async fn fetch_shielded_transfers<IO: Io>(
+    async fn fetch_shielded_transfers(
         &self,
-        progress: &impl ProgressTracker<IO>,
-        shutdown_signal: &mut ShutdownSignal,
-        mut tx_sender: FetchQueueSender,
-        BlockHeight(from): BlockHeight,
-        BlockHeight(to): BlockHeight,
-    ) -> Result<(), Error> {
+        from: BlockHeight,
+        to: BlockHeight,
+    ) -> Result<BlockRange, Error> {
         // Fetch all the transactions we do not have yet
-        let mut fetch_iter = progress.fetch(from..=to);
-
-        loop {
-            let Some(height) = fetch_iter.peek().copied() else {
-                break;
-            };
-            _ = fetch_iter.next();
-
-            if shutdown_signal.received() {
-                return Err(Error::Interrupt(
-                    "[ShieldedSync::Fetching]".to_string(),
-                ));
-            }
-            if tx_sender.contains_height(height) {
-                continue;
-            }
+        let mut range = BlockRange {
+            from,
+            to,
+            txs: vec![],
+        };
+        for height in from.0..=to.0 {
+            // TODO: Fix
+            // if tx_sender.contains_height(height) {
+            //     continue;
+            // }
 
             let txs_results = match get_indexed_masp_events_at_height(
-                self.client,
+                &*self.client,
                 height.into(),
                 None,
             )
@@ -206,7 +202,6 @@ impl<C: Client + Sync> MaspClient for LedgerMaspClient<'_, C> {
                 .map_err(|e| Error::from(QueryError::General(e.to_string())))?
                 .block
                 .data;
-
             for (idx, masp_sections_refs) in txs_results {
                 let tx = Tx::try_from(block[idx.0 as usize].as_ref())
                     .map_err(|e| Error::Other(e.to_string()))?;
@@ -216,7 +211,7 @@ impl<C: Client + Sync> MaspClient for LedgerMaspClient<'_, C> {
                     } else {
                         extract_masp_tx_from_ibc_message(&tx)?
                     };
-                tx_sender.send((
+                range.txs.push((
                     IndexedTx {
                         height: height.into(),
                         index: idx,
@@ -226,7 +221,7 @@ impl<C: Client + Sync> MaspClient for LedgerMaspClient<'_, C> {
             }
         }
 
-        Ok(())
+        Ok(range)
     }
 
     #[inline(always)]
@@ -326,6 +321,7 @@ impl IndexerMaspClient {
 }
 
 #[cfg(not(target_family = "wasm"))]
+#[async_trait::async_trait]
 impl MaspClient for IndexerMaspClient {
     #[inline(always)]
     fn capabilities(&self) -> MaspClientCapabilities {
@@ -371,14 +367,11 @@ impl MaspClient for IndexerMaspClient {
         })
     }
 
-    async fn fetch_shielded_transfers<IO: Io>(
+    async fn fetch_shielded_transfers(
         &self,
-        progress: &impl ProgressTracker<IO>,
-        shutdown_signal: &mut ShutdownSignal,
-        mut tx_sender: FetchQueueSender,
         BlockHeight(mut from): BlockHeight,
         BlockHeight(to): BlockHeight,
-    ) -> Result<(), Error> {
+    ) -> Result<BlockRange, Error> {
         use serde::Deserialize;
 
         #[derive(Deserialize)]
@@ -407,7 +400,11 @@ impl MaspClient for IndexerMaspClient {
         }
 
         const MAX_RANGE_THRES: u64 = 30;
-        let mut fetch_iter = progress.fetch(from..=to);
+        let mut range = BlockRange {
+            from: BlockHeight(from),
+            to: BlockHeight(to),
+            txs: vec![],
+        };
 
         loop {
             let from_height = from;
@@ -415,7 +412,7 @@ impl MaspClient for IndexerMaspClient {
             let to_height = from + off;
             from += off;
 
-            let txs_fut = async {
+            let payload: TxResponse = {
                 let response = self
                     .client
                     .get(self.endpoint("/tx"))
@@ -436,29 +433,13 @@ impl MaspClient for IndexerMaspClient {
                          {from_height}-{to_height}: {err}"
                     )));
                 }
-                let payload: TxResponse =
-                    response.json().await.map_err(|err| {
-                        Error::Other(format!(
-                            "Could not deserialize the transactions JSON \
-                             response in the height range \
-                             {from_height}-{to_height}: {err}"
-                        ))
-                    })?;
-
-                Ok::<_, Error>(payload)
+                response.json().await.map_err(|err| {
+                    Error::Other(format!(
+                        "Could not deserialize the transactions JSON response \
+                         in the height range {from_height}-{to_height}: {err}"
+                    ))
+                })?
             };
-            let payload = tokio::select! {
-                maybe_payload = txs_fut => {
-                    maybe_payload?
-                }
-                _ = &mut *shutdown_signal => {
-                    return Err(Error::Interrupt(
-                        "[ShieldedSync::Fetching]".to_string(),
-                    ));
-                }
-            };
-
-            let mut last_height = None;
 
             for Transaction {
                 batch,
@@ -482,19 +463,13 @@ impl MaspClient for IndexerMaspClient {
                     );
                 }
 
-                tx_sender.send((
+                range.txs.push((
                     IndexedTx {
                         height: BlockHeight(block_height),
                         index: TxIndex(block_index),
                     },
                     extracted_masp_txs,
                 ));
-
-                let curr_height = Some(block_height);
-                if curr_height > last_height {
-                    last_height = curr_height;
-                    _ = fetch_iter.next();
-                }
             }
 
             if from >= to {
@@ -502,12 +477,7 @@ impl MaspClient for IndexerMaspClient {
             }
         }
 
-        // NB: a hack to drain the iterator in case
-        // there were still some items left
-        // TODO: improve this lol
-        while fetch_iter.next().is_some() {}
-
-        Ok(())
+        Ok(range)
     }
 
     async fn fetch_commitment_tree(
@@ -681,93 +651,47 @@ impl MaspClient for IndexerMaspClient {
     }
 }
 
-/// A channel-like struct for "sending" newly fetched blocks
-/// to the scanning algorithm.
-///
-/// Holds a pointer to the unscanned cache which it can append to.
-/// Furthermore, has an actual channel for keeping track if
-/// 1. The process in possession of the channel is still alive
-/// 2. Quickly updating the latest block height scanned.
-#[derive(Clone)]
-pub struct FetchQueueSender {
-    cache: Unscanned,
-    last_fetched: flume::Sender<BlockHeight>,
+pub struct BlockRange {
+    pub from: BlockHeight,
+    pub to: BlockHeight,
+    pub txs: Vec<IndexedNoteEntry>,
 }
 
-/// A channel-like struct for "receiving" new fetched
-/// blocks for the scanning algorithm.
-///
-/// This is implemented as an iterator for the scanning
-/// algorithm. This receiver pulls from the cache until
-/// it is empty. It then waits until new entries appear
-/// in the cache or the sender hangs up.
-#[derive(Clone)]
-pub(super) struct FetchQueueReceiver {
-    cache: Unscanned,
-    last_fetched: flume::Receiver<BlockHeight>,
-}
+impl Eq for BlockRange {}
 
-impl FetchQueueReceiver {
-    /// Check if the sender has hung up.
-    fn sender_alive(&self) -> bool {
-        self.last_fetched.sender_count() > 0
+impl PartialEq for BlockRange {
+    fn eq(&self, other: &Self) -> bool {
+        (self.from, self.to).eq(&(other.from, other.to))
     }
 }
 
-impl Iterator for FetchQueueReceiver {
-    type Item = IndexedNoteEntry;
+impl Ord for BlockRange {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (other.from, other.to).cmp(&(self.from, self.to))
+    }
+}
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(entry) = self.cache.pop_first() {
-            Some(entry)
+impl PartialOrd for BlockRange {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        (other.from, other.to).partial_cmp(&(self.from, self.to))
+    }
+}
+
+pub struct FetchedTxs {
+    heap: BinaryHeap<BlockRange>,
+    curr_block_height: BlockHeight,
+}
+
+impl FetchedTxs {
+    fn next(&mut self) -> Option<BlockRange> {
+        let maybe_next = self.heap.peek()?;
+
+        if maybe_next.from == self.curr_block_height {
+            self.curr_block_height = maybe_next.to + 1;
+            self.heap.pop()
         } else {
-            while self.sender_alive() {
-                if let Some(entry) = self.cache.pop_first() {
-                    return Some(entry);
-                }
-                core::hint::spin_loop();
-            }
             None
         }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let size = self.last_fetched.len();
-        (size, Some(size))
-    }
-}
-
-impl FetchQueueSender {
-    /// Checks if the channel is already populated for the given block height
-    pub(super) fn contains_height(&self, height: u64) -> bool {
-        self.cache.contains_height(height)
-    }
-
-    /// Send a new value of the channel
-    pub(super) fn send(&mut self, data: IndexedNoteEntry) {
-        self.last_fetched.send(data.0.height).unwrap();
-        self.cache.insert(data);
-    }
-}
-
-/// A convenience for creating a channel for fetching blocks.
-pub mod fetch_channel {
-
-    use super::{FetchQueueReceiver, FetchQueueSender, Unscanned};
-    pub(in super::super) fn new(
-        cache: Unscanned,
-    ) -> (FetchQueueSender, FetchQueueReceiver) {
-        let (fetch_send, fetch_recv) = flume::unbounded();
-        (
-            FetchQueueSender {
-                cache: cache.clone(),
-                last_fetched: fetch_send,
-            },
-            FetchQueueReceiver {
-                cache: cache.clone(),
-                last_fetched: fetch_recv,
-            },
-        )
     }
 }
 

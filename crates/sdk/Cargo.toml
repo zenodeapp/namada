@@ -30,7 +30,7 @@ rand = ["dep:rand", "rand_core", "namada_core/rand"]
 tendermint-rpc = ["async-client", "dep:tendermint-rpc"]
 
 # Enable queries support for an async client
-async-client = ["async-trait"]
+async-client = []
 
 async-send = []
 
@@ -88,7 +88,7 @@ namada_token = { path = "../token" }
 namada_tx = { path = "../tx" }
 namada_vote_ext = { path = "../vote_ext" }
 
-async-trait = { workspace = true, optional = true }
+async-trait.workspace = true
 bimap.workspace = true
 borsh.workspace = true
 borsh-ext.workspace = true
