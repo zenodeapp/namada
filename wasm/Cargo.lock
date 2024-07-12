@@ -3836,7 +3836,6 @@ dependencies = [
  "namada_gas",
  "namada_governance",
  "namada_macros",
- "namada_parameters",
  "namada_state",
  "namada_storage",
  "namada_systems",
