@@ -217,6 +217,7 @@ mod tests {
     use address::testing::arb_non_internal_address;
     use namada_test_utils::TestWasms;
     use namada_tests::governance;
+    use namada_tests::governance::parameters::GovernanceParameters;
     // Use this as `#[test]` annotation to enable logging
     use namada_tests::log::test;
     use namada_tests::native_vp::pos::init_pos;
@@ -227,7 +228,9 @@ mod tests {
     use namada_tests::vp::vp_host_env::storage::Key;
     use namada_tests::vp::*;
     use namada_tx_prelude::dec::Dec;
-    use namada_tx_prelude::proof_of_stake::parameters::PosParams;
+    use namada_tx_prelude::proof_of_stake::parameters::{
+        OwnedPosParams, PosParams,
+    };
     use namada_tx_prelude::proof_of_stake::types::GenesisValidator;
     use namada_tx_prelude::storage::Epoch;
     use namada_tx_prelude::{StorageWrite, TxEnv};
@@ -469,7 +472,7 @@ mod tests {
     #[test]
     fn test_unsigned_non_validator_pos_action_rejected() {
         // Init PoS genesis
-        let pos_params = PosParams::default();
+        let pos_params = OwnedPosParams::default();
         let validator = address::testing::established_address_3();
         let initial_stake = token::Amount::from_uint(10_098_123, 0).unwrap();
         let consensus_key = key::testing::keypair_2().ref_to();
@@ -560,8 +563,14 @@ mod tests {
     #[test]
     fn test_unjail_with_demotion() {
         // Genesis validators
-        let mut pos_params = PosParams::default();
-        pos_params.owned.max_validator_slots = 2;
+        let pos_params = PosParams {
+            owned: OwnedPosParams {
+                max_validator_slots: 2,
+                ..Default::default()
+            },
+            max_proposal_period: GovernanceParameters::default()
+                .max_proposal_period,
+        };
 
         // Common
         let protocol_key = key::testing::keypair_1().ref_to();
@@ -647,6 +656,7 @@ mod tests {
         .unwrap();
 
         // Jail validator3
+
         jail_validator::<_, governance::Store<_>>(
             &mut tx_env.state,
             &pos_params,
@@ -707,7 +717,7 @@ mod tests {
     #[test]
     fn test_unsigned_become_validator_pos_action_rejected() {
         // Init PoS genesis
-        let pos_params = PosParams::default();
+        let pos_params = OwnedPosParams::default();
         let validator = address::testing::established_address_3();
         let initial_stake = token::Amount::from_uint(10_098_123, 0).unwrap();
         let consensus_key = key::testing::keypair_2().ref_to();
@@ -804,7 +814,7 @@ mod tests {
     #[test]
     fn test_unsigned_validator_pos_action_rejected() {
         // Init PoS genesis
-        let pos_params = PosParams::default();
+        let pos_params = OwnedPosParams::default();
         let validator = address::testing::established_address_3();
         let initial_stake = token::Amount::from_uint(10_098_123, 0).unwrap();
         let consensus_key = key::testing::keypair_2().ref_to();
@@ -907,7 +917,7 @@ mod tests {
     #[test]
     fn test_signed_non_validator_pos_action_accepted() {
         // Init PoS genesis
-        let pos_params = PosParams::default();
+        let pos_params = OwnedPosParams::default();
         let validator = address::testing::established_address_3();
         let initial_stake = token::Amount::from_uint(10_098_123, 0).unwrap();
         let consensus_key = key::testing::keypair_2().ref_to();
@@ -1002,7 +1012,7 @@ mod tests {
     #[test]
     fn test_signed_become_validator_pos_action_accepted() {
         // Init PoS genesis
-        let pos_params = PosParams::default();
+        let pos_params = OwnedPosParams::default();
         let validator = address::testing::established_address_3();
         let initial_stake = token::Amount::from_uint(10_098_123, 0).unwrap();
         let consensus_key = key::testing::keypair_2().ref_to();
@@ -1098,7 +1108,7 @@ mod tests {
     #[test]
     fn test_signed_validator_pos_action_accepted() {
         // Init PoS genesis
-        let pos_params = PosParams::default();
+        let pos_params = OwnedPosParams::default();
         let validator = address::testing::established_address_3();
         let initial_stake = token::Amount::from_uint(10_098_123, 0).unwrap();
         let consensus_key = key::testing::keypair_2().ref_to();

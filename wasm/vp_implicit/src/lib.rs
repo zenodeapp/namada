@@ -257,7 +257,7 @@ mod tests {
     use namada_tests::vp::*;
     // Use this as `#[test]` annotation to enable logging
     use namada_tx_prelude::dec::Dec;
-    use namada_tx_prelude::proof_of_stake::parameters::PosParams;
+    use namada_tx_prelude::proof_of_stake::parameters::OwnedPosParams;
     use namada_tx_prelude::proof_of_stake::types::GenesisValidator;
     use namada_tx_prelude::storage::Epoch;
     use namada_tx_prelude::{StorageWrite, TxEnv};
@@ -485,7 +485,7 @@ mod tests {
     #[test]
     fn test_unsigned_pos_action_rejected() {
         // Init PoS genesis
-        let pos_params = PosParams::default();
+        let pos_params = OwnedPosParams::default();
         let validator = address::testing::established_address_3();
         let initial_stake = token::Amount::from_uint(10_098_123, 0).unwrap();
         let consensus_key = key::testing::keypair_2().ref_to();
@@ -579,7 +579,7 @@ mod tests {
     #[test]
     fn test_signed_pos_action_accepted() {
         // Init PoS genesis
-        let pos_params = PosParams::default();
+        let pos_params = OwnedPosParams::default();
         let validator = address::testing::established_address_3();
         let initial_stake = token::Amount::from_uint(10_098_123, 0).unwrap();
         let consensus_key = key::testing::keypair_2().ref_to();
