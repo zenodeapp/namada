@@ -15,8 +15,8 @@ use tendermint_rpc::SimpleRequest;
 use crate::error::Error;
 use crate::io::Io;
 use crate::masp::utils::{
-    BlockRange, FetchQueueSender, IterProgress, MaspClient,
-    MaspClientCapabilities, PeekableIter, ProgressTracker,
+    BlockRange, IterProgress, MaspClient, MaspClientCapabilities, PeekableIter,
+    ProgressTracker,
 };
 use crate::masp::IndexedNoteEntry;
 use crate::queries::testing::TestClient;

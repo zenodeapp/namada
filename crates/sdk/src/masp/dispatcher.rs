@@ -1,5 +1,4 @@
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{self, AtomicBool, AtomicUsize};
@@ -190,7 +189,7 @@ impl PanicFlag {
 
         #[cfg(not(target_family = "wasm"))]
         {
-            self.inner.load(atomic::Ordering::Relaxed);
+            self.inner.load(atomic::Ordering::Relaxed)
         }
     }
 }
@@ -225,7 +224,7 @@ struct DispatcherTasks<Spawner> {
     panic_flag: PanicFlag,
 }
 
-impl DispatcherTasks {
+impl<Spawner> DispatcherTasks<Spawner> {
     async fn get_next_message(&mut self) -> Option<Result<Message, Error>> {
         if let Either::Left((maybe_message, _)) =
             select(self.message_receiver.recv_async(), &mut self.active_tasks)
@@ -255,13 +254,13 @@ struct InitialState {
     last_query_height: BlockHeight,
 }
 
-pub struct Dispatcher<M, U>
+pub struct Dispatcher<M, U, S>
 where
     U: ShieldedUtils,
 {
     client: M,
     state: DispatcherState,
-    tasks: DispatcherTasks,
+    tasks: DispatcherTasks<S>,
     ctx: ShieldedContext<U>,
 }
 
@@ -269,9 +268,12 @@ where
 ///
 /// This function assumes that the provided shielded context has
 /// already been loaded from storage.
-pub async fn new<S, M, U>(spawner: S, client: M, utils: &U) -> Dispatcher<M, U>
+pub async fn new<S, M, U>(
+    spawner: S,
+    client: M,
+    utils: &U,
+) -> Dispatcher<M, U, S>
 where
-    S: TaskSpawner,
     M: MaspClient,
     U: ShieldedUtils,
 {
@@ -308,7 +310,7 @@ where
         message_receiver,
         message_sender,
         active_tasks: AsyncCounter::new(),
-        panic_flag: PanicFlag::new(),
+        panic_flag: PanicFlag::default(),
     };
 
     Dispatcher {
@@ -324,10 +326,11 @@ where
     }
 }
 
-impl<M, U> Dispatcher<M, U>
+impl<M, U, S> Dispatcher<M, U, S>
 where
     M: MaspClient + Send + Sync + 'static,
     U: ShieldedUtils,
+    S: TaskSpawner,
 {
     pub async fn run(
         mut self,
@@ -346,7 +349,7 @@ where
             )
             .await?;
 
-        while Some(message) = self.tasks.get_next_message().await {
+        while let Some(message) = self.tasks.get_next_message().await {
             self.check_exit_conditions(&mut shutdown_signal);
             self.handle_incoming_message(message);
         }
@@ -531,7 +534,7 @@ where
             self.tasks.panic_flag.clone(),
         );
 
-        self.tasks.spawn_async(async move {
+        self.tasks.spawner.spawn_async(async move {
             let _guard = guard;
             sender.send_async(fut.await).await.unwrap();
         });
@@ -539,7 +542,7 @@ where
 
     fn spawn_sync<F>(&self, job: F)
     where
-        F: FnOnce() + Send + 'static,
+        F: FnOnce() -> Result<Message, Error> + Send + 'static,
     {
         let sender = self.tasks.message_sender.clone();
         let guard = (
@@ -547,7 +550,7 @@ where
             self.tasks.panic_flag.clone(),
         );
 
-        self.tasks.spawn_sync(move || {
+        self.tasks.spawner.spawn_sync(move || {
             let _guard = guard;
             sender.send(job()).unwrap();
         });

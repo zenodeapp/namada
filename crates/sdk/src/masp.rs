@@ -662,12 +662,14 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
         IO: Io,
         M: MaspClient + Send + Sync + 'static,
     {
+        use self::dispatcher::{LocalSetTaskEnvironment, TaskEnvironment};
+
         let shutdown_signal = control_flow::install_shutdown_signal();
 
         // TODO: `load_confirmed` should return an owned
         // `ShieldedContext`, instead of modifying `self`
 
-        task_env
+        LocalSetTaskEnvironment::new(500)?
             .run(|spawner| async move {
                 let dispatcher =
                     dispatcher::new(spawner, client, &self.utils).await;
