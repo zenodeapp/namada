@@ -2,15 +2,21 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{self, AtomicBool, AtomicUsize};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use futures::future::{select, Either};
+use futures::task::AtomicWaker;
 use masp_primitives::merkle_tree::{CommitmentTree, IncrementalWitness};
 use masp_primitives::sapling::{Node, ViewingKey};
 use masp_primitives::zip32::ExtendedSpendingKey;
 use namada_core::collections::HashMap;
 use namada_core::hash::Hash;
+use namada_core::hints;
 use namada_core::storage::BlockHeight;
 use namada_tx::IndexedTx;
+use tokio::task::LocalSet;
 
 use crate::control_flow::ShutdownSignal;
 use crate::error::Error;
@@ -20,51 +26,182 @@ use crate::masp::{
     ShieldedContext, ShieldedUtils,
 };
 
-#[derive(Debug)]
-struct Weighted<W, T> {
-    weight: W,
-    value: T,
+struct AsyncCounterInner {
+    waker: AtomicWaker,
+    count: AtomicUsize,
 }
 
-impl<W, T> Weighted<W, T> {
-    const fn new(weight: W, value: T) -> Self {
-        Self { weight, value }
+impl AsyncCounterInner {
+    fn increment(&self) {
+        self.count.fetch_add(1, atomic::Ordering::Relaxed);
     }
 }
 
-impl<W: PartialEq, T> PartialEq for Weighted<W, T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.weight == other.weight
+struct AsyncCounter {
+    inner: Arc<AsyncCounterInner>,
+}
+
+impl AsyncCounter {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(AsyncCounterInner {
+                waker: AtomicWaker::new(),
+                count: AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    fn value(&self) -> usize {
+        self.inner.count.load(atomic::Ordering::Relaxed)
     }
 }
 
-impl<W: Eq, T> Eq for Weighted<W, T> {}
-
-impl<W: PartialOrd, T> PartialOrd for Weighted<W, T> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.weight.partial_cmp(&other.weight)
+impl Clone for AsyncCounter {
+    fn clone(&self) -> Self {
+        let inner = Arc::clone(&self.inner);
+        inner.increment();
+        Self { inner }
     }
 }
 
-impl<W: Ord, T> Ord for Weighted<W, T> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.weight.cmp(&other.weight)
+impl Drop for AsyncCounter {
+    fn drop(&mut self) {
+        if self.inner.count.fetch_sub(1, atomic::Ordering::Relaxed) == 1 {
+            self.inner.waker.wake();
+        }
     }
 }
 
-struct Task {
-    receiver: tokio::sync::oneshot::Receiver<Result<Message, Error>>,
+impl Future for AsyncCounter {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.value() == 0 {
+            Poll::Ready(())
+        } else {
+            self.inner.waker.register(cx.waker());
+            Poll::Pending
+        }
+    }
 }
 
-/// Tasks that the dispatcher can schedule
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(u8)]
-pub enum TaskKind {
-    FetchTxs = 0,
-    TrialDecrypt = 1,
-    UpdateCommitmentTree = 2,
-    UpdateWitness = 3,
-    UpdateNotesMap = 100,
+/// Spawn tasks onto a thread pool.
+pub trait TaskSpawner {
+    /// Spawn an async task onto a thread pool.
+    fn spawn_async<F>(&self, fut: F)
+    where
+        F: Future<Output = ()> + 'static;
+
+    /// Spawn a sync task onto a thread pool.
+    fn spawn_sync<F>(&self, job: F)
+    where
+        F: FnOnce() + Send + 'static;
+}
+
+/// Task spawner that uses a [`LocalSet`].
+#[cfg(not(target_family = "wasm"))]
+pub struct LocalSetSpawner {
+    pool: rayon::ThreadPool,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl TaskSpawner for LocalSetSpawner {
+    #[inline]
+    fn spawn_async<F>(&self, fut: F)
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        tokio::task::spawn_local(fut);
+    }
+
+    #[inline]
+    fn spawn_sync<F>(&self, job: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.pool.spawn(job);
+    }
+}
+
+/// An environment to run async tasks on.
+pub trait TaskEnvironment {
+    /// Task spawner implementation.
+    type Spawner: TaskSpawner;
+
+    /// Run the provided async task to completion.
+    ///
+    /// An async task spawner is provided, to execute
+    /// additional work in the background.
+    async fn run<M, F, R>(self, main: M) -> R
+    where
+        M: FnOnce(Self::Spawner) -> F,
+        F: Future<Output = R>;
+}
+
+/// A task environment that uses a [`LocalSet`].
+#[cfg(not(target_family = "wasm"))]
+pub struct LocalSetTaskEnvironment {
+    pool: rayon::ThreadPool,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl LocalSetTaskEnvironment {
+    /// Create a new [`LocalSetTaskEnvironment`] with `num_threads` workers.
+    pub fn new(num_threads: usize) -> Result<Self, Error> {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(MAX_POOL_THREADS)
+            .build()
+            .map_err(|err| {
+                Error::Other(format!("Failed to create thread pool: {err}"))
+            })?;
+        Ok(Self { pool })
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl TaskEnvironment for LocalSetTaskEnvironment {
+    type Spawner = LocalSetSpawner;
+
+    async fn run<M, F, R>(self, main: M) -> R
+    where
+        M: FnOnce(Self::Spawner) -> F,
+        F: Future<Output = R>,
+    {
+        let Self { pool } = self;
+
+        LocalSet::new()
+            .run_until(main(LocalSetSpawner { pool }))
+            .await
+    }
+}
+
+#[derive(Clone, Default)]
+struct PanicFlag {
+    #[cfg(not(target_family = "wasm"))]
+    inner: Arc<AtomicBool>,
+}
+
+impl PanicFlag {
+    fn panicked(&self) -> bool {
+        #[cfg(target_family = "wasm")]
+        {
+            false
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.inner.load(atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Drop for PanicFlag {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.inner.store(true, atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 pub enum Message {
@@ -80,73 +217,26 @@ pub enum Message {
     ),
 }
 
-struct DispatcherTasks {
-    queue: BinaryHeap<Weighted<TaskKind, Task>>,
-    max_msg_size: usize,
+struct DispatcherTasks<Spawner> {
+    spawner: Spawner,
+    message_receiver: flume::Receiver<Result<Message, Error>>,
+    message_sender: flume::Sender<Result<Message, Error>>,
+    active_tasks: AsyncCounter,
+    panic_flag: PanicFlag,
 }
 
 impl DispatcherTasks {
-    #[inline]
-    fn has_running_tasks(&self) -> bool {
-        !self.queue.is_empty()
-    }
-
-    async fn retrieve_data_to_cache(
-        self,
-    ) -> (
-        Vec<Vec<IndexedNoteEntry>>,
-        Vec<(
-            ScannedData,
-            HashMap<Hash, (IndexedTx, ViewingKey, DecryptedData)>,
-        )>,
-    ) {
-        let mut fetched_cache = vec![];
-        let mut scanned_cache = vec![];
-        for Weighted {
-            value: Task { receiver },
-            ..
-        } in self.queue.into_vec()
+    async fn get_next_message(&mut self) -> Option<Result<Message, Error>> {
+        if let Either::Left((maybe_message, _)) =
+            select(self.message_receiver.recv_async(), &mut self.active_tasks)
+                .await
         {
-            match receiver.await {
-                Ok(Ok(Message::FetchTxs(msg))) => fetched_cache.push(msg),
-                Ok(Ok(Message::TrialDecrypt(msg))) => scanned_cache.push(msg),
-                _ => {}
-            }
-        }
-        (fetched_cache, scanned_cache)
-    }
-}
-
-impl Future for DispatcherTasks {
-    type Output = Vec<Result<Message, Error>>;
-
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Self::Output> {
-        if self.queue.is_empty() {
-            return Poll::Ready(vec![]);
-        }
-        let tasks_to_check = self.queue.len().min(self.max_msg_size);
-        let mut msgs = Vec::with_capacity(tasks_to_check);
-        for _ in 0..tasks_to_check {
-            let Weighted {
-                weight: task_kind,
-                value: mut task,
-            } = self.queue.pop().unwrap();
-            let pinned_rx = std::pin::pin!(&mut task.receiver);
-            if let Poll::Ready(m) = pinned_rx.poll(cx) {
-                msgs.push(m.unwrap_or_else(|_| {
-                    panic!("Dispatched task halted unexpectedly")
-                }));
-            } else {
-                self.queue.push(Weighted::new(task_kind, task))
-            }
-        }
-        if msgs.is_empty() {
-            Poll::Pending
+            let Ok(message) = maybe_message else {
+                unreachable!("There must be at least one sender alive");
+            };
+            Some(message)
         } else {
-            Poll::Ready(msgs)
+            None
         }
     }
 }
@@ -179,10 +269,12 @@ where
 ///
 /// This function assumes that the provided shielded context has
 /// already been loaded from storage.
-pub async fn new<M: MaspClient, U: ShieldedUtils>(
-    client: M,
-    utils: &U,
-) -> Dispatcher<M, U> {
+pub async fn new<S, M, U>(spawner: S, client: M, utils: &U) -> Dispatcher<M, U>
+where
+    S: TaskSpawner,
+    M: MaspClient,
+    U: ShieldedUtils,
+{
     let ctx = {
         let mut ctx = ShieldedContext {
             utils: utils.clone(),
@@ -209,9 +301,14 @@ pub async fn new<M: MaspClient, U: ShieldedUtils>(
         DispatcherState::Normal
     };
 
+    let (message_sender, message_receiver) = flume::bounded(32);
+
     let tasks = DispatcherTasks {
-        queue: BinaryHeap::new(),
-        max_msg_size: 8,
+        spawner,
+        message_receiver,
+        message_sender,
+        active_tasks: AsyncCounter::new(),
+        panic_flag: PanicFlag::new(),
     };
 
     Dispatcher {
@@ -232,14 +329,18 @@ where
     M: MaspClient + Send + Sync + 'static,
     U: ShieldedUtils,
 {
-    pub async fn run(
+    pub async fn run<E>(
         mut self,
+        task_env: E,
         mut shutdown_signal: ShutdownSignal,
         start_query_height: Option<BlockHeight>,
         last_query_height: Option<BlockHeight>,
         sks: &[ExtendedSpendingKey],
         fvks: &[ViewingKey],
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error>
+    where
+        E: TaskEnvironment,
+    {
         let _initial_state = self
             .perform_initial_setup(
                 start_query_height,
@@ -249,17 +350,9 @@ where
             )
             .await?;
 
-        while self.tasks.has_running_tasks() {
-            let next_message_batch = {
-                let pinned_tasks = std::pin::pin!(&mut self.tasks);
-                pinned_tasks.await
-            };
-
-            self.check_if_interrupted(&mut shutdown_signal);
-
-            for message in next_message_batch {
-                self.handle_incoming_message(message);
-            }
+        while Some(message) = self.tasks.get_next_message().await {
+            self.check_exit_conditions(&mut shutdown_signal);
+            self.handle_incoming_message(message);
         }
 
         if let DispatcherState::Errored(err) = self.state {
@@ -330,7 +423,12 @@ where
         Ok(initial_state)
     }
 
-    fn check_if_interrupted(&mut self, shutdown_signal: &mut ShutdownSignal) {
+    fn check_exit_conditions(&mut self, shutdown_signal: &mut ShutdownSignal) {
+        if hints::unlikely(self.tasks.panic_flag.panicked()) {
+            self.state = DispatcherState::Errored(Error::Other(
+                "A worker thread panicked during the shielded sync".into(),
+            ));
+        }
         if matches!(
             &self.state,
             DispatcherState::Interrupted | DispatcherState::Errored(_)
@@ -425,26 +523,35 @@ where
         }
     }
 
-    fn spawn<F>(&mut self, kind: TaskKind, fut: F)
+    fn spawn_async<F>(&self, fut: F)
     where
-        F: Future<Output = Result<Message, Error>> + Send + 'static,
+        F: Future<Output = Result<Message, Error>> + 'static,
     {
-        debug_assert!(
-            !(matches!(&self.state, DispatcherState::WaitingForNotesMap)
-                && kind == TaskKind::TrialDecrypt)
+        let sender = self.tasks.message_sender.clone();
+        let guard = (
+            self.tasks.active_tasks.clone(),
+            self.tasks.panic_flag.clone(),
         );
 
-        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.tasks.spawn_async(async move {
+            let _guard = guard;
+            sender.send_async(fut.await).await.unwrap();
+        });
+    }
 
-        self.tasks
-            .queue
-            .push(Weighted::new(kind, Task { receiver }));
+    fn spawn_sync<F>(&self, job: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let sender = self.tasks.message_sender.clone();
+        let guard = (
+            self.tasks.active_tasks.clone(),
+            self.tasks.panic_flag.clone(),
+        );
 
-        tokio::spawn(async move {
-            let result = fut.await;
-            sender.send(result).unwrap_or_else(|_| {
-                panic!("Dispatcher has halted unexpectedly")
-            });
+        self.tasks.spawn_sync(move || {
+            let _guard = guard;
+            sender.send(job()).unwrap();
         });
     }
 }

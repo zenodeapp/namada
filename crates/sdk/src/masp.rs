@@ -667,24 +667,29 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
         // TODO: `load_confirmed` should return an owned
         // `ShieldedContext`, instead of modifying `self`
 
-        let dispatcher = dispatcher::new(client, &self.utils).await;
+        task_env
+            .run(|spawner| async move {
+                let dispatcher =
+                    dispatcher::new(spawner, client, &self.utils).await;
 
-        dispatcher
-            .run(
-                shutdown_signal,
-                start_query_height,
-                last_query_height,
-                sks,
-                fvks,
-            )
-            .await?;
+                dispatcher
+                    .run(
+                        shutdown_signal,
+                        start_query_height,
+                        last_query_height,
+                        sks,
+                        fvks,
+                    )
+                    .await?;
 
-        self.load().await.map_err(|err| {
-            Error::Other(format!(
-                "Failed to reload the updated shielded context from disk: \
-                 {err}"
-            ))
-        })
+                self.load().await.map_err(|err| {
+                    Error::Other(format!(
+                        "Failed to reload the updated shielded context from \
+                         disk: {err}"
+                    ))
+                })
+            })
+            .await
 
         // self.fetch_aux(
         //    client,
