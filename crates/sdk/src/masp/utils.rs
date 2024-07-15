@@ -90,14 +90,15 @@ impl MaspClientCapabilities {
 /// of how shielded-sync fetches the necessary data
 /// from a remote server.
 // TODO: redesign this api with progress bars in mind
-#[async_trait::async_trait]
 pub trait MaspClient: Clone {
     /// Return the last block height we can retrieve data from.
+    #[allow(async_fn_in_trait)]
     async fn last_block_height(&self) -> Result<Option<BlockHeight>, Error>;
 
     /// Fetch shielded transfers from blocks heights in the range `[from, to]`,
     /// keeping track of progress through `progress`. The fetched transfers
     /// are sent over to a separate worker through `tx_sender`.
+    #[allow(async_fn_in_trait)]
     async fn fetch_shielded_transfers(
         &self,
         from: BlockHeight,
@@ -108,18 +109,21 @@ pub trait MaspClient: Clone {
     fn capabilities(&self) -> MaspClientCapabilities;
 
     /// Fetch the commitment tree of height `height`.
+    #[allow(async_fn_in_trait)]
     async fn fetch_commitment_tree(
         &self,
         height: BlockHeight,
     ) -> Result<CommitmentTree<Node>, Error>;
 
     /// Fetch the tx notes map of height `height`.
+    #[allow(async_fn_in_trait)]
     async fn fetch_tx_notes_map(
         &self,
         height: BlockHeight,
     ) -> Result<BTreeMap<IndexedTx, usize>, Error>;
 
     /// Fetch the witness map of height `height`.
+    #[allow(async_fn_in_trait)]
     async fn fetch_witness_map(
         &self,
         height: BlockHeight,
@@ -153,7 +157,6 @@ impl<C> LedgerMaspClient<C> {
 }
 
 #[cfg(not(target_family = "wasm"))]
-#[async_trait::async_trait]
 impl<C: Client + Send + Sync> MaspClient for LedgerMaspClient<C> {
     async fn last_block_height(&self) -> Result<Option<BlockHeight>, Error> {
         let maybe_block = crate::rpc::query_block(&*self.client).await?;
@@ -321,7 +324,6 @@ impl IndexerMaspClient {
 }
 
 #[cfg(not(target_family = "wasm"))]
-#[async_trait::async_trait]
 impl MaspClient for IndexerMaspClient {
     #[inline(always)]
     fn capabilities(&self) -> MaspClientCapabilities {

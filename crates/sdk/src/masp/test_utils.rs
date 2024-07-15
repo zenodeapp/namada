@@ -216,7 +216,6 @@ impl<'client> TestingMaspClient<'client> {
     }
 }
 
-#[async_trait::async_trait]
 impl MaspClient for TestingMaspClient<'_> {
     async fn last_block_height(&self) -> Result<Option<BlockHeight>, Error> {
         Ok(self
