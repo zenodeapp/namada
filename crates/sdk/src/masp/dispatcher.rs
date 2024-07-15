@@ -149,7 +149,7 @@ impl LocalSetTaskEnvironment {
     /// Create a new [`LocalSetTaskEnvironment`] with `num_threads` workers.
     pub fn new(num_threads: usize) -> Result<Self, Error> {
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(MAX_POOL_THREADS)
+            .num_threads(num_threads)
             .build()
             .map_err(|err| {
                 Error::Other(format!("Failed to create thread pool: {err}"))
@@ -329,18 +329,14 @@ where
     M: MaspClient + Send + Sync + 'static,
     U: ShieldedUtils,
 {
-    pub async fn run<E>(
+    pub async fn run(
         mut self,
-        task_env: E,
         mut shutdown_signal: ShutdownSignal,
         start_query_height: Option<BlockHeight>,
         last_query_height: Option<BlockHeight>,
         sks: &[ExtendedSpendingKey],
         fvks: &[ViewingKey],
-    ) -> Result<(), Error>
-    where
-        E: TaskEnvironment,
-    {
+    ) -> Result<(), Error> {
         let _initial_state = self
             .perform_initial_setup(
                 start_query_height,
@@ -448,7 +444,7 @@ where
             let client = self.client.clone();
             let height = initial_state.last_query_height;
 
-            self.spawn(TaskKind::UpdateNotesMap, async move {
+            self.spawn_async(async move {
                 client
                     .fetch_tx_notes_map(height)
                     .await
@@ -460,7 +456,7 @@ where
             let client = self.client.clone();
             let height = initial_state.last_query_height;
 
-            self.spawn(TaskKind::UpdateCommitmentTree, async move {
+            self.spawn_async(async move {
                 client
                     .fetch_commitment_tree(height)
                     .await
@@ -472,7 +468,7 @@ where
             let client = self.client.clone();
             let height = initial_state.last_query_height;
 
-            self.spawn(TaskKind::UpdateWitness, async move {
+            self.spawn_async(async move {
                 client
                     .fetch_witness_map(height)
                     .await
