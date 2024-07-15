@@ -483,6 +483,8 @@ where
 
     fn handle_incoming_message(&mut self, result: Result<Message, Error>) {
         if matches!(&self.state, DispatcherState::Errored(_)) {
+            // TODO: we probably still want to cache things even
+            // in the errored state!
             return;
         }
 
