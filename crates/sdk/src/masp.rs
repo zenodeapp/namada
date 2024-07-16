@@ -73,13 +73,14 @@ use thiserror::Error;
 
 use crate::error::{Error, QueryError};
 use crate::io::Io;
-use crate::masp::utils::{MaspClient, ProgressTracker, RetryStrategy};
+use crate::masp::utils::{MaspClient, RetryStrategy};
 use crate::queries::Client;
 use crate::rpc::{query_conversion, query_denom};
 use crate::{
     control_flow, display_line, edisplay_line, query_native_token, rpc,
     MaybeSend, MaybeSync, Namada,
 };
+use crate::task_env::TaskEnvironment;
 
 /// Randomness seed for MASP integration tests to build proofs with
 /// deterministic rng.
@@ -648,10 +649,10 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
     /// ShieldedContext
     #[allow(clippy::too_many_arguments)]
     #[cfg(not(target_family = "wasm"))]
-    pub async fn fetch<IO, M>(
+    pub async fn fetch<M>(
         &mut self,
         client: M,
-        _progress: &impl ProgressTracker<IO>,
+        env: impl TaskEnvironment,
         start_query_height: Option<BlockHeight>,
         last_query_height: Option<BlockHeight>,
         _retry: RetryStrategy,
@@ -659,18 +660,13 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
         fvks: &[ViewingKey],
     ) -> Result<(), Error>
     where
-        IO: Io,
         M: MaspClient + Send + Sync + 'static,
     {
-        use self::dispatcher::{LocalSetTaskEnvironment, TaskEnvironment};
 
         let shutdown_signal = control_flow::install_shutdown_signal();
 
-        // TODO: `load_confirmed` should return an owned
-        // `ShieldedContext`, instead of modifying `self`
 
-        LocalSetTaskEnvironment::new(500)?
-            .run(|spawner| async move {
+        env.run(|spawner| async move {
                 let dispatcher =
                     dispatcher::new(spawner, client, &self.utils).await;
 
@@ -2491,7 +2487,7 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
         for vk in vks {
             self.vk_heights.entry(vk).or_default();
 
-            self.scan_tx(indexed_tx.clone(), masp_tx, &vk)?;
+            self.scan_tx(indexed_tx, masp_tx, &vk)?;
         }
         // Save the speculative state for future usage
         self.save().await.map_err(|e| Error::Other(e.to_string()))?;

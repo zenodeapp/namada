@@ -675,7 +675,7 @@ impl Ord for BlockRange {
 
 impl PartialOrd for BlockRange {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        (other.from, other.to).partial_cmp(&(self.from, self.to))
+        Some(self.cmp(other))
     }
 }
 

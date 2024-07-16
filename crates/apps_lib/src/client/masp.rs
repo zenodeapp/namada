@@ -15,11 +15,12 @@ use namada_sdk::masp::{IndexedNoteEntry, ShieldedContext, ShieldedUtils};
 use namada_sdk::queries::Client;
 use namada_sdk::storage::BlockHeight;
 use namada_sdk::{display, display_line, MaybeSend, MaybeSync};
+use namada_sdk::task_env::LocalSetTaskEnvironment;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn syncing<
     U: ShieldedUtils + MaybeSend + MaybeSync,
-    C: Client + Sync,
+    C: Client + Send + Sync + 'static,
     IO: Io + Send + Sync,
 >(
     mut shielded: ShieldedContext<U>,
@@ -45,14 +46,14 @@ pub async fn syncing<
         );
     }
     display_line!(io, "\n\n");
-    let tracker = CliProgressTracker::new(io);
+    let env = LocalSetTaskEnvironment::new(500)?;
 
     macro_rules! dispatch_client {
         ($client:expr) => {
             shielded
                 .fetch(
                     $client,
-                    &tracker,
+                    env,
                     start_query_height,
                     last_query_height,
                     RetryStrategy::Forever,

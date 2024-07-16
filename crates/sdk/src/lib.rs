@@ -44,6 +44,7 @@ pub mod io;
 pub mod migrations;
 pub mod queries;
 pub mod wallet;
+pub mod task_env;
 
 #[cfg(feature = "async-send")]
 pub use std::marker::Send as MaybeSend;

@@ -15,15 +15,16 @@ use namada_core::hash::Hash;
 use namada_core::hints;
 use namada_core::storage::BlockHeight;
 use namada_tx::IndexedTx;
-use tokio::task::LocalSet;
+use typed_builder::TypedBuilder;
 
 use crate::control_flow::ShutdownSignal;
 use crate::error::Error;
-use crate::masp::utils::MaspClient;
+use crate::masp::utils::{BlockRange, MaspClient};
 use crate::masp::{
-    to_viewing_key, DecryptedData, IndexedNoteEntry, ScannedData,
+    to_viewing_key, DecryptedData, ScannedData,
     ShieldedContext, ShieldedUtils,
 };
+use crate::task_env::TaskSpawner;
 
 struct AsyncCounterInner {
     waker: AtomicWaker,
@@ -84,95 +85,6 @@ impl Future for AsyncCounter {
     }
 }
 
-/// Spawn tasks onto a thread pool.
-pub trait TaskSpawner {
-    /// Spawn an async task onto a thread pool.
-    fn spawn_async<F>(&self, fut: F)
-    where
-        F: Future<Output = ()> + 'static;
-
-    /// Spawn a sync task onto a thread pool.
-    fn spawn_sync<F>(&self, job: F)
-    where
-        F: FnOnce() + Send + 'static;
-}
-
-/// Task spawner that uses a [`LocalSet`].
-#[cfg(not(target_family = "wasm"))]
-pub struct LocalSetSpawner {
-    pool: rayon::ThreadPool,
-}
-
-#[cfg(not(target_family = "wasm"))]
-impl TaskSpawner for LocalSetSpawner {
-    #[inline]
-    fn spawn_async<F>(&self, fut: F)
-    where
-        F: Future<Output = ()> + 'static,
-    {
-        tokio::task::spawn_local(fut);
-    }
-
-    #[inline]
-    fn spawn_sync<F>(&self, job: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        self.pool.spawn(job);
-    }
-}
-
-/// An environment to run async tasks on.
-pub trait TaskEnvironment {
-    /// Task spawner implementation.
-    type Spawner: TaskSpawner;
-
-    /// Run the provided async task to completion.
-    ///
-    /// An async task spawner is provided, to execute
-    /// additional work in the background.
-    async fn run<M, F, R>(self, main: M) -> R
-    where
-        M: FnOnce(Self::Spawner) -> F,
-        F: Future<Output = R>;
-}
-
-/// A task environment that uses a [`LocalSet`].
-#[cfg(not(target_family = "wasm"))]
-pub struct LocalSetTaskEnvironment {
-    pool: rayon::ThreadPool,
-}
-
-#[cfg(not(target_family = "wasm"))]
-impl LocalSetTaskEnvironment {
-    /// Create a new [`LocalSetTaskEnvironment`] with `num_threads` workers.
-    pub fn new(num_threads: usize) -> Result<Self, Error> {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(num_threads)
-            .build()
-            .map_err(|err| {
-                Error::Other(format!("Failed to create thread pool: {err}"))
-            })?;
-        Ok(Self { pool })
-    }
-}
-
-#[cfg(not(target_family = "wasm"))]
-impl TaskEnvironment for LocalSetTaskEnvironment {
-    type Spawner = LocalSetSpawner;
-
-    async fn run<M, F, R>(self, main: M) -> R
-    where
-        M: FnOnce(Self::Spawner) -> F,
-        F: Future<Output = R>,
-    {
-        let Self { pool } = self;
-
-        LocalSet::new()
-            .run_until(main(LocalSetSpawner { pool }))
-            .await
-    }
-}
 
 #[derive(Clone, Default)]
 struct PanicFlag {
@@ -194,6 +106,7 @@ impl PanicFlag {
     }
 }
 
+
 #[cfg(not(target_family = "wasm"))]
 impl Drop for PanicFlag {
     fn drop(&mut self) {
@@ -207,7 +120,7 @@ pub enum Message {
     UpdateCommitmentTree(CommitmentTree<Node>),
     UpdateNotesMap(BTreeMap<IndexedTx, usize>),
     UpdateWitness(HashMap<usize, IncrementalWitness<Node>>),
-    FetchTxs(Vec<IndexedNoteEntry>),
+    FetchTxs(BlockRange),
     TrialDecrypt(
         (
             ScannedData,
@@ -254,6 +167,12 @@ struct InitialState {
     last_query_height: BlockHeight,
 }
 
+pub struct Config {
+    pub block_batch_size: usize,
+    pub channel_buffer_size: usize,
+}
+
+
 pub struct Dispatcher<M, U, S>
 where
     U: ShieldedUtils,
@@ -262,16 +181,18 @@ where
     state: DispatcherState,
     tasks: DispatcherTasks<S>,
     ctx: ShieldedContext<U>,
+    config: Config,
 }
 
 /// Create a new dispatcher in the initial state.
 ///
 /// This function assumes that the provided shielded context has
 /// already been loaded from storage.
-pub async fn new<S, M, U>(
+async fn new<S, M, U>(
     spawner: S,
     client: M,
     utils: &U,
+    config: Config,
 ) -> Dispatcher<M, U, S>
 where
     M: MaspClient,
@@ -303,7 +224,7 @@ where
         DispatcherState::Normal
     };
 
-    let (message_sender, message_receiver) = flume::bounded(32);
+    let (message_sender, message_receiver) = flume::bounded(config.channel_buffer_size);
 
     let tasks = DispatcherTasks {
         spawner,
@@ -318,6 +239,7 @@ where
         ctx,
         tasks,
         client,
+        config,
         // TODO: add some kind of retry strategy,
         // when a fetch task fails
         //
@@ -332,6 +254,10 @@ where
     U: ShieldedUtils,
     S: TaskSpawner,
 {
+    pub fn builder() -> DispatcherBuilder<M, U, S> {
+        Default::defualt()
+    }
+
     pub async fn run(
         mut self,
         mut shutdown_signal: ShutdownSignal,
@@ -440,8 +366,6 @@ where
     }
 
     fn spawn_initial_set_of_tasks(&mut self, initial_state: &InitialState) {
-        // TODO: spawn initial tasks
-        // - fetch txs
 
         if self.client.capabilities().may_fetch_pre_built_notes_map() {
             let client = self.client.clone();
@@ -476,6 +400,18 @@ where
                     .fetch_witness_map(height)
                     .await
                     .map(Message::UpdateWitness)
+            });
+        }
+
+        let batch_size = self.config.block_batch_size;
+        for from in (initial_state.start_height.0 .. initial_state.last_query_height.0).step_by(batch_size) {
+            let client = self.client.clone();
+            let to = (from + batch_size as u64).min(initial_state.last_query_height.0);
+            self.spawn_async(async move {
+                client
+                    .fetch_shielded_transfers(BlockHeight(from), BlockHeight(to))
+                    .await
+                    .map(Message::FetchTxs)
             });
         }
     }
@@ -556,3 +492,62 @@ where
         });
     }
 }
+
+#[derive(Default)]
+pub struct DispatcherBuilder<M, U, S>
+where
+    U: ShieldedUtils,
+{
+    client: Option<M>,
+    utils: Option<U>,
+    spawner: Option<S>,
+    channel_buffer_size: Option<usize>,
+    block_batch_size: Option<usize>,
+}
+
+impl<M, U, S> DispatcherBuilder<M, U, S>
+where
+    M: MaspClient,
+    U: ShieldedUtils
+{
+    const DEFAULT_BUF_SIZE: usize = 32;
+    const DEFAULT_BATCH_SIZE: usize = 10;
+
+    pub fn with_client(mut self, client: M) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    pub fn with_spawner(mut self, spawner: S) -> Self {
+        self.spawner = Some(spawner);
+        self
+    }
+
+    pub fn channel_buffer_size(mut self, size: usize) -> Self {
+        self.channel_buffer_size = (size > 0).then_some(size);
+        self
+    }
+
+    pub fn block_batch_size(mut self, size: usize) -> Self {
+        self.block_batch_size = (size > 0).then_some(size);
+        self
+    }
+
+    pub fn with_utils(mut self, utils: U) -> Self {
+        self.utils = Some(utils);
+        self
+    }
+
+    pub async fn build(self) -> Dispatcher<M, U, S> {
+        new(
+            self.spawner.expect("No spawner provided to the builder"),
+            self.client.expect("No client provided to the builder"),
+            self.utils.as_ref().expect("No utils provided to the builder"),
+            Config {
+                block_batch_size: self.block_batch_size.unwrap_or(Self::DEFAULT_BATCH_SIZE),
+                channel_buffer_size: self.channel_buffer_size.unwrap_or(Self::DEFAULT_BUF_SIZE),
+            }
+        ).await
+    }
+}
+
