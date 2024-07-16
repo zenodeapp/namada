@@ -276,6 +276,9 @@ bench:
 fuzz-txs-mempool:
 	$(cargo) +$(nightly) fuzz run txs_mempool --dev
 
+fuzz-txs-prepare-proposal:
+	$(cargo) +$(nightly) fuzz run txs_prepare_proposal --dev
+
 build-doc:
 	$(cargo) doc --no-deps
 
