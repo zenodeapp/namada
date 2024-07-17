@@ -460,13 +460,19 @@ where
                 }
             }
             Message::FetchTxs(Ok(_tx_batch)) => {
-                // NOTE: if the client cannot fetch a notes map,
-                // we need to incrementally build it... so we
-                // can't just store things in cache, in those
-                // cases, we also need to update the notes map
-                // in the shielded context, otherwise we won't
-                // be able to start scanning anything
                 todo!()
+
+                // TODO:
+                // - keeps all txs in cache
+                // - keep an unscanned binary heap,
+                // which simply stores block ranges
+                // (from, to)
+                //   - to scan new txs, we pull block
+                //   ranges from this heap
+                // - at the end of the algorithm, we
+                // need to go through each tx in cache
+                // in order, and update the commitment
+                // tree, witness map and tx notes map
             }
             Message::FetchTxs(Err(TaskError {
                 error,
