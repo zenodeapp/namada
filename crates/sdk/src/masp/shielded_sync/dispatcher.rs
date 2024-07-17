@@ -161,6 +161,7 @@ pub enum Requested<T> {
     Pending(BlockHeight),
 }
 
+#[derive(Default)]
 struct DispatcherCache {
     pub commitment_tree: Requested<(BlockHeight, CommitmentTree<Node>)>,
     pub witness_map: Requested<(BlockHeight, WitnessMap)>,
@@ -252,7 +253,8 @@ where
     };
 
     // TODO: load cache from file
-    let cache = { todo!() };
+    let cache = DispatcherCache::default();
+
     Dispatcher {
         state,
         ctx,
