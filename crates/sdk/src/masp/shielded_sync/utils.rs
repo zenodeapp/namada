@@ -184,7 +184,7 @@ pub trait MaspClient: Clone {
         &self,
         from: BlockHeight,
         to: BlockHeight,
-    ) -> Result<BlockRange, Error>;
+    ) -> Result<TxsInBlockRange, Error>;
 
     /// Return the capabilities of this client.
     fn capabilities(&self) -> MaspClientCapabilities;
@@ -248,9 +248,9 @@ impl<C: Client + Send + Sync> MaspClient for LedgerMaspClient<C> {
         &self,
         from: BlockHeight,
         to: BlockHeight,
-    ) -> Result<BlockRange, Error> {
+    ) -> Result<TxsInBlockRange, Error> {
         // Fetch all the transactions we do not have yet
-        let mut range = BlockRange {
+        let mut range = TxsInBlockRange {
             from,
             to,
             txs: vec![],
@@ -454,7 +454,7 @@ impl MaspClient for IndexerMaspClient {
         &self,
         BlockHeight(mut from): BlockHeight,
         BlockHeight(to): BlockHeight,
-    ) -> Result<BlockRange, Error> {
+    ) -> Result<TxsInBlockRange, Error> {
         use serde::Deserialize;
 
         #[derive(Deserialize)]
@@ -483,7 +483,7 @@ impl MaspClient for IndexerMaspClient {
         }
 
         const MAX_RANGE_THRES: u64 = 30;
-        let mut range = BlockRange {
+        let mut range = TxsInBlockRange {
             from: BlockHeight(from),
             to: BlockHeight(to),
             txs: vec![],
@@ -734,39 +734,39 @@ impl MaspClient for IndexerMaspClient {
     }
 }
 
-pub struct BlockRange {
+pub struct TxsInBlockRange {
     pub from: BlockHeight,
     pub to: BlockHeight,
     pub txs: Vec<IndexedNoteEntry>,
 }
 
-impl Eq for BlockRange {}
+impl Eq for TxsInBlockRange {}
 
-impl PartialEq for BlockRange {
+impl PartialEq for TxsInBlockRange {
     fn eq(&self, other: &Self) -> bool {
         (self.from, self.to).eq(&(other.from, other.to))
     }
 }
 
-impl Ord for BlockRange {
+impl Ord for TxsInBlockRange {
     fn cmp(&self, other: &Self) -> Ordering {
         (other.from, other.to).cmp(&(self.from, self.to))
     }
 }
 
-impl PartialOrd for BlockRange {
+impl PartialOrd for TxsInBlockRange {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 pub struct FetchedTxs {
-    heap: BinaryHeap<BlockRange>,
+    heap: BinaryHeap<TxsInBlockRange>,
     curr_block_height: BlockHeight,
 }
 
 impl FetchedTxs {
-    fn next(&mut self) -> Option<BlockRange> {
+    fn next(&mut self) -> Option<TxsInBlockRange> {
         let maybe_next = self.heap.peek()?;
 
         if maybe_next.from == self.curr_block_height {

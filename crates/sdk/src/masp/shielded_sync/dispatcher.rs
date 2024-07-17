@@ -17,7 +17,7 @@ use namada_core::hints;
 use namada_core::storage::BlockHeight;
 use namada_tx::IndexedTx;
 
-use super::utils::{BlockRange, MaspClient};
+use super::utils::{MaspClient, TxsInBlockRange};
 use crate::control_flow::ShutdownSignal;
 use crate::error::Error;
 use crate::masp::utils::{RetryStrategy, Unscanned};
@@ -115,20 +115,26 @@ impl Drop for PanicFlag {
     }
 }
 
-pub enum Message {
-    UpdateCommitmentTree(Result<CommitmentTree<Node>, BlockHeight>),
-    UpdateNotesMap(Result<BTreeMap<IndexedTx, usize>, BlockHeight>),
-    UpdateWitness(
+struct TaskError<C> {
+    error: Error,
+    context: C,
+}
+
+enum Message {
+    UpdateCommitmentTree(Result<CommitmentTree<Node>, TaskError<BlockHeight>>),
+    UpdateNotesMap(Result<BTreeMap<IndexedTx, usize>, TaskError<BlockHeight>>),
+    UpdateWitnessMap(
         Result<HashMap<usize, IncrementalWitness<Node>>, BlockHeight>,
     ),
-    FetchTxs(Result<BlockRange, [BlockHeight; 2]>),
+    FetchTxs(Result<TxsInBlockRange, TaskError<[BlockHeight; 2]>>),
     TrialDecrypt(
         Result<
             (
                 ScannedData,
                 HashMap<Hash, (IndexedTx, ViewingKey, DecryptedData)>,
             ),
-            Error,
+            // TODO: change this context type to smth else
+            TaskError<()>,
         >,
     ),
 }
@@ -157,16 +163,11 @@ impl<Spawner> DispatcherTasks<Spawner> {
     }
 }
 
-pub enum Requested<T> {
-    Received(T),
-    Pending(BlockHeight),
-}
-
 #[derive(Default)]
 struct DispatcherCache {
-    pub commitment_tree: Requested<(BlockHeight, CommitmentTree<Node>)>,
-    pub witness_map: Requested<(BlockHeight, WitnessMap)>,
-    pub tx_note_map: Requested<(BlockHeight, TxNoteMap)>,
+    pub commitment_tree: Option<(BlockHeight, CommitmentTree<Node>)>,
+    pub witness_map: Option<(BlockHeight, WitnessMap)>,
+    pub tx_note_map: Option<(BlockHeight, TxNoteMap)>,
     pub unscanned: Unscanned,
 }
 
@@ -200,6 +201,7 @@ where
     ctx: ShieldedContext<U>,
     config: Config,
     cache: DispatcherCache,
+    height_to_sync: BlockHeight,
 }
 
 /// Create a new dispatcher in the initial state.
@@ -257,6 +259,7 @@ where
     let cache = DispatcherCache::default();
 
     Dispatcher {
+        height_to_sync: BlockHeight(0),
         state,
         ctx,
         tasks,
@@ -296,15 +299,27 @@ where
             self.handle_incoming_message(message);
         }
 
-        if let DispatcherState::Errored(err) = self.state {
-            return Err(err);
+        // TODO: save cache
+
+        match self.state {
+            DispatcherState::Errored(err) => Err(err),
+            DispatcherState::Interrupted => {
+                Err(Error::Other("The shielded sync was interrupted".into()))
+            }
+            DispatcherState::WaitingForNotesMap => unreachable!(
+                "All system messages are consumed, so we never finish in this \
+                 state"
+            ),
+            DispatcherState::Normal => {
+                self.ctx.save().await.map_err(|err| {
+                    Error::Other(format!(
+                        "Failed to save the shielded context: {err}"
+                    ))
+                })?;
+
+                Ok(())
+            }
         }
-
-        self.ctx.save().await.map_err(|err| {
-            Error::Other(format!("Failed to save the shielded context: {err}"))
-        })?;
-
-        Ok(())
     }
 
     async fn perform_initial_setup(
@@ -359,6 +374,7 @@ where
             start_height,
         };
 
+        self.height_to_sync = initial_state.last_query_height;
         self.spawn_initial_set_of_tasks(&initial_state);
 
         Ok(initial_state)
@@ -396,61 +412,61 @@ where
 
         let batch_size = self.config.block_batch_size;
         for from in (initial_state.start_height.0
-            ..initial_state.last_query_height.0)
+            ..=initial_state.last_query_height.0)
             .step_by(batch_size)
         {
             let client = self.client.clone();
             let to = (from + batch_size as u64)
                 .min(initial_state.last_query_height.0);
-            self.spawn_async(async move {
-                client
-                    .fetch_shielded_transfers(
-                        BlockHeight(from),
-                        BlockHeight(to),
-                    )
-                    .await
-                    .map(Message::FetchTxs)
-            });
+            self.spawn_fetch_txs(BlockHeight(from), BlockHeight(to));
         }
     }
 
     fn handle_incoming_message(&mut self, message: Message) -> ControlFlow<()> {
         match message {
-            Message::UpdateCommitmentTree(commitment_tree) => {
-                match commitment_tree {
-                    Ok(ct) => self.cache.commitment_tree = Some((height, ct)),
-                    Err(height) => {
-                        self.can_launch_new_fetch_retry()?;
-                        self.spawn_update_commitment_tree(height);
-                    }
-                }
+            Message::UpdateCommitmentTree(Ok(ct)) => {
+                self.cache.commitment_tree.insert((self.height_to_sync, ct));
             }
-            Message::UpdateNotesMap(notes_map) => match notes_map {
-                Ok(nm) => {
-                    if let DispatcherState::WaitingForNotesMap = &self.state {
-                        self.state = DispatcherState::Normal;
-                    }
-                    self.ctx.tx_note_map = nm;
+            Message::UpdateCommitmentTree(Err(TaskError {
+                error,
+                context: height,
+            })) => {
+                self.can_launch_new_fetch_retry()?;
+                self.spawn_update_commitment_tree(height);
+            }
+            Message::UpdateNotesMap(Ok(nm)) => {
+                if let DispatcherState::WaitingForNotesMap = &self.state {
+                    self.state = DispatcherState::Normal;
                 }
-                Err(height) => {
-                    self.can_launch_new_fetch_retry()?;
-                    self.spawn_update_tx_notes_map(height);
-                }
-            },
-            Message::UpdateWitness(witness_map) => match witness_map {
-                Ok(wm) => self.ctx.witness_map = wm,
-                Err(height) => {
-                    self.can_launch_new_fetch_retry()?;
-                    self.spawn_update_witness_map(height);
-                }
-            },
-            Message::FetchTxs(tx_batch) => match tx_batch {
-                Ok(tx_batch) => {}
-                Err([from, to]) => {
-                    self.can_launch_new_fetch_retry()?;
-                    self.spawn_fetch_tx(from, to);
-                }
-            },
+                self.cache.tx_note_map.insert((self.height_to_sync, ct));
+            }
+            Message::UpdateNotesMap(Err(TaskError {
+                error,
+                context: height,
+            })) => {
+                self.can_launch_new_fetch_retry(error)?;
+                self.spawn_update_tx_notes_map(height);
+            }
+            Message::UpdateWitnessMap(Ok(wm)) => {
+                self.cache.witness_map.insert((self.height_to_sync, wm));
+            }
+            Message::UpdateWitnessMap(Err(TaskError {
+                error,
+                context: height,
+            })) => {
+                self.can_launch_new_fetch_retry(error)?;
+                self.spawn_update_witness_map(height);
+            }
+            Message::FetchTxs(Ok(_tx_batch)) => {
+                todo!()
+            }
+            Message::FetchTxs(Err(TaskError {
+                error,
+                context: [from, to],
+            })) => {
+                self.can_launch_new_fetch_retry(error)?;
+                self.spawn_fetch_txs(from, to);
+            }
             Message::TrialDecrypt(_decrypted_note_batch) => {
                 todo!()
             }
@@ -459,21 +475,27 @@ where
     }
 
     /// Check if we can launch a new fetch task retry.
-    fn can_launch_new_fetch_retry(&mut self) -> ControlFlow<()> {
+    fn can_launch_new_fetch_retry(&mut self, error: Error) -> ControlFlow<()> {
         if matches!(
             self.state,
             DispatcherState::Errored(_) | DispatcherState::Interrupted
         ) {
+            return ControlFlow::Break(());
+        }
+
+        if self.config.retry_strategy.retry().is_break() {
+            self.state = DispatcherState::Errored(error);
             ControlFlow::Break(())
         } else {
-            self.config.retry_strategy.retry()
+            tracing::warn!(reason = %error, "Fetch failure, retrying...");
+            ControlFlow::Continue(())
         }
     }
 
     fn spawn_update_witness_map(&mut self, height: BlockHeight) {
         match self.cache.witness_map.take() {
             Some((h, wm)) if h == height => {
-                self.spawn_async(async move { Message::UpdateWitness(Ok(wm)) })
+                self.spawn_sync(move || Message::UpdateWitnessMap(Ok(wm)))
             }
             _ => {
                 let client = self.client.clone();
@@ -481,8 +503,11 @@ where
                     client
                         .fetch_witness_map(height)
                         .await
-                        .map(Message::UpdateWitness)
-                        .map_err(|_| height)
+                        .map(Message::UpdateWitnessMap)
+                        .map_err(|error| TaskError {
+                            error,
+                            context: height,
+                        })
                 })
             }
         }
@@ -490,9 +515,9 @@ where
 
     fn spawn_update_commitment_tree(&mut self, height: BlockHeight) {
         match self.cache.commitment_tree.take() {
-            Some((h, ct)) if h == height => self.spawn_async(async move {
-                Message::UpdateCommitmentTree(Ok(ct))
-            }),
+            Some((h, ct)) if h == height => {
+                self.spawn_sync(move || Message::UpdateCommitmentTree(Ok(ct)))
+            }
             _ => {
                 let client = self.client.clone();
                 self.spawn_async(async move {
@@ -509,7 +534,7 @@ where
     fn spawn_update_tx_notes_map(&mut self, height: BlockHeight) {
         match self.cache.tx_note_map.take() {
             Some((h, nm)) if h == height => {
-                self.spawn_async(async move { Message::UpdateNotesMap(Ok(nm)) })
+                self.spawn_sync(move || Message::UpdateNotesMap(Ok(nm)))
             }
             _ => {
                 let client = self.client.clone();
@@ -518,20 +543,26 @@ where
                         .fetch_tx_notes_map(height)
                         .await
                         .map(Message::UpdateNotesMap)
-                        .map_err(|_| height)
+                        .map_err(|error| TaskError {
+                            error,
+                            context: height,
+                        })
                 });
             }
         }
     }
 
-    fn spawn_fetch_tx(&self, from: BlockHeight, to: BlockHeight) {
+    fn spawn_fetch_txs(&self, from: BlockHeight, to: BlockHeight) {
         let client = self.client.clone();
         self.spawn_async(async move {
             client
                 .fetch_shielded_transfers(from, to)
                 .await
                 .map(Message::FetchTxs)
-                .map_err(|_| [from, to])
+                .map_err(|error| TaskError {
+                    error,
+                    context: [from, to],
+                })
         })
     }
 

@@ -15,8 +15,8 @@ use tendermint_rpc::SimpleRequest;
 use crate::error::Error;
 use crate::io::Io;
 use crate::masp::utils::{
-    BlockRange, IterProgress, MaspClient, MaspClientCapabilities, PeekableIter,
-    ProgressTracker,
+    IterProgress, MaspClient, MaspClientCapabilities, PeekableIter,
+    ProgressTracker, TxsInBlockRange,
 };
 use crate::masp::IndexedNoteEntry;
 use crate::queries::testing::TestClient;
@@ -231,8 +231,8 @@ impl MaspClient for TestingMaspClient<'_> {
         &self,
         from: BlockHeight,
         to: BlockHeight,
-    ) -> Result<BlockRange, Error> {
-        let mut range = BlockRange {
+    ) -> Result<TxsInBlockRange, Error> {
+        let mut range = TxsInBlockRange {
             from,
             to,
             txs: vec![],
