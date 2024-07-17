@@ -497,6 +497,8 @@ where
                 }
             }
             Message::TrialDecrypt(_decrypted_note_batch) => {
+                // TODO: pull out these successful trial decryptions
+                // from the set of unscanned block ranges
                 todo!()
             }
         }
