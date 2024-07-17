@@ -464,11 +464,16 @@ where
 
                 // TODO:
                 // - keeps all txs in cache
-                // - keep an unscanned binary heap,
-                // which simply stores block ranges
-                // (from, to)
+                // - keep an unscanned set (doesn't need
+                // to be ordered), which simply stores
+                // block ranges (from, to)
                 //   - to scan new txs, we pull block
-                //   ranges from this heap
+                //   ranges from the set
+                //   - trial decryptions don't have any
+                //   ordering constraints, we just need
+                //   a viewing key and a sapling note
+                //   (shielded output) as inputs to the
+                //   trial decryption
                 // - at the end of the algorithm, we
                 // need to go through each tx in cache
                 // in order, and update the commitment
