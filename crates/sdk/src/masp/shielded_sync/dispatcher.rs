@@ -224,6 +224,9 @@ where
             ..Default::default()
         };
 
+        // TODO: defer loading of shielded context;
+        // the only thing we need from it are potentially
+        // viewking keys that had been stored on it
         if ctx.load_confirmed().await.is_err() {
             ctx = ShieldedContext {
                 utils: utils.clone(),
@@ -309,6 +312,12 @@ where
                  state"
             ),
             DispatcherState::Normal => {
+                // TODO: load shielded context at this stage
+
+                // TODO: go through sync phase of the algorithm,
+                // gathering+processing all data collected in cache
+                // onto the loaded shielded context
+
                 self.ctx.save().await.map_err(|err| {
                     Error::Other(format!(
                         "Failed to save the shielded context: {err}"
