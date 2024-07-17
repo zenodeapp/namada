@@ -9,9 +9,9 @@ use namada_sdk::error::Error;
 use namada_sdk::io::Io;
 use namada_sdk::masp::utils::{
     IndexerMaspClient, LedgerMaspClient, PeekableIter, ProgressTracker,
-    ProgressType, RetryStrategy,
+    ProgressType,
 };
-use namada_sdk::masp::{IndexedNoteEntry, ShieldedContext, ShieldedUtils};
+use namada_sdk::masp::{IndexedNoteEntry, ShieldedContext, ShieldedSyncConfig, ShieldedUtils};
 use namada_sdk::queries::Client;
 use namada_sdk::storage::BlockHeight;
 use namada_sdk::{display, display_line, MaybeSend, MaybeSync};
@@ -48,20 +48,25 @@ pub async fn syncing<
     display_line!(io, "\n\n");
     let env = LocalSetTaskEnvironment::new(500)?;
 
+
     macro_rules! dispatch_client {
         ($client:expr) => {
+            {
+            let config = ShieldedSyncConfig::builder()
+                .client($client)
+                .build();
             shielded
                 .fetch(
-                    $client,
                     env,
+                    config,
                     start_query_height,
                     last_query_height,
-                    RetryStrategy::Forever,
                     sks,
                     fvks,
                 )
                 .await
                 .map(|_| shielded)
+            }
         };
     }
 

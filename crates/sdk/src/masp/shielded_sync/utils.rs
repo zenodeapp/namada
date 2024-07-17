@@ -29,18 +29,16 @@ pub enum RetryStrategy {
     Times(u64),
 }
 
-impl Iterator for RetryStrategy {
-    type Item = ();
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl RetryStrategy {
+    pub fn retry(&mut self) -> std::ops::ControlFlow<()> {
         match self {
-            Self::Forever => Some(()),
-            Self::Times(count) => {
-                if *count == 0 {
-                    None
+            RetryStrategy::Forever => std::ops::ControlFlow::Continue(()),
+            RetryStrategy::Times(left) => {
+                *left = left.saturating_sub(1);
+                if *left > 0 {
+                    std::ops::ControlFlow::Continue(())
                 } else {
-                    *count -= 1;
-                    Some(())
+                    std::ops::ControlFlow::Break(())
                 }
             }
         }

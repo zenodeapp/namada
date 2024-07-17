@@ -1,9 +1,8 @@
 //! MASP verification wrappers.
 
-mod dispatcher;
+mod shielded_sync;
 #[cfg(test)]
 mod test_utils;
-pub mod utils;
 
 use std::cmp::Ordering;
 use std::collections::{btree_map, BTreeMap, BTreeSet};
@@ -73,7 +72,9 @@ use thiserror::Error;
 
 use crate::error::{Error, QueryError};
 use crate::io::Io;
-use crate::masp::utils::{MaspClient, RetryStrategy};
+pub use crate::masp::shielded_sync::{ShieldedSyncConfig, ShieldedSyncConfigBuilder};
+pub use crate::masp::shielded_sync::utils;
+use crate::masp::shielded_sync::utils::MaspClient;
 use crate::queries::Client;
 use crate::rpc::{query_conversion, query_denom};
 use crate::{
@@ -438,6 +439,12 @@ pub type TransferDelta = HashMap<Address, MaspChange>;
 /// Represents the changes that were made to a list of shielded accounts
 pub type TransactionDelta = HashMap<ViewingKey, I128Sum>;
 
+/// Maps a shielded tx to the index of its first output note.
+pub type  TxNoteMap =  BTreeMap<IndexedTx, usize>;
+
+/// Maps the note index (in the commitment tree) to a witness
+pub type WitnessMap = HashMap<usize, IncrementalWitness<Node>>;
+
 /// A cache of fetched indexed transactions.
 ///
 /// An invariant that shielded-sync maintains is that
@@ -547,7 +554,7 @@ pub struct ShieldedContext<U: ShieldedUtils> {
     /// Maps note positions to the diversifier of their payment address
     pub div_map: HashMap<usize, Diversifier>,
     /// Maps note positions to their witness (used to make merkle paths)
-    pub witness_map: HashMap<usize, IncrementalWitness<Node>>,
+    pub witness_map: WitnessMap,
     /// The set of note positions that have been spent
     pub spents: HashSet<usize>,
     /// Maps asset types to their decodings
@@ -555,7 +562,7 @@ pub struct ShieldedContext<U: ShieldedUtils> {
     /// Maps note positions to their corresponding viewing keys
     pub vk_map: HashMap<usize, ViewingKey>,
     /// Maps a shielded tx to the index of its first output note.
-    pub tx_note_map: BTreeMap<IndexedTx, usize>,
+    pub tx_note_map: TxNoteMap,
     /// A cache of fetched indexed txs.
     pub unscanned: Unscanned,
     /// The sync state of the context
@@ -651,11 +658,10 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
     #[cfg(not(target_family = "wasm"))]
     pub async fn fetch<M>(
         &mut self,
-        client: M,
         env: impl TaskEnvironment,
+        config: ShieldedSyncConfig<M>,
         start_query_height: Option<BlockHeight>,
         last_query_height: Option<BlockHeight>,
-        _retry: RetryStrategy,
         sks: &[ExtendedSpendingKey],
         fvks: &[ViewingKey],
     ) -> Result<(), Error>
@@ -665,29 +671,28 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
 
         let shutdown_signal = control_flow::install_shutdown_signal();
 
-
         env.run(|spawner| async move {
-                let dispatcher =
-                    dispatcher::new(spawner, client, &self.utils).await;
+            let dispatcher =
+                config.dispatcher(spawner, &self.utils).await;
 
-                dispatcher
-                    .run(
-                        shutdown_signal,
-                        start_query_height,
-                        last_query_height,
-                        sks,
-                        fvks,
-                    )
-                    .await?;
+            dispatcher
+                .run(
+                    shutdown_signal,
+                    start_query_height,
+                    last_query_height,
+                    sks,
+                    fvks,
+                )
+                .await?;
 
-                self.load().await.map_err(|err| {
-                    Error::Other(format!(
-                        "Failed to reload the updated shielded context from \
-                         disk: {err}"
-                    ))
-                })
+            self.load().await.map_err(|err| {
+                Error::Other(format!(
+                    "Failed to reload the updated shielded context from \
+                     disk: {err}"
+                ))
             })
-            .await
+        })
+        .await
 
         // self.fetch_aux(
         //    client,
