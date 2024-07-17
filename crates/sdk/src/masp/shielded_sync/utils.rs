@@ -2,6 +2,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
+use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
 
 use borsh::BorshDeserialize;
@@ -112,15 +113,15 @@ pub enum RetryStrategy {
 }
 
 impl RetryStrategy {
-    pub fn retry(&mut self) -> std::ops::ControlFlow<()> {
+    pub fn retry(&mut self) -> ControlFlow<()> {
         match self {
-            RetryStrategy::Forever => std::ops::ControlFlow::Continue(()),
+            RetryStrategy::Forever => ControlFlow::Continue(()),
             RetryStrategy::Times(left) => {
-                *left = left.saturating_sub(1);
-                if *left > 0 {
-                    std::ops::ControlFlow::Continue(())
+                if *left == 0 {
+                    ControlFlow::Break(())
                 } else {
-                    std::ops::ControlFlow::Break(())
+                    *left -= 1;
+                    ControlFlow::Continue(())
                 }
             }
         }

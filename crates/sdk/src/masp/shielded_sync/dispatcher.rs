@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::atomic::{self, AtomicBool, AtomicUsize};
 use std::sync::Arc;
@@ -413,16 +414,13 @@ where
         }
     }
 
-    fn handle_incoming_message(
-        &mut self,
-        message: Message,
-    ) -> std::ops::ControlFlow<()> {
+    fn handle_incoming_message(&mut self, message: Message) -> ControlFlow<()> {
         match message {
             Message::UpdateCommitmentTree(commitment_tree) => {
                 match commitment_tree {
                     Ok(ct) => self.cache.commitment_tree = Some((height, ct)),
                     Err(height) => {
-                        self.can_spawn_more_shit()?;
+                        self.can_launch_new_fetch_retry()?;
                         self.spawn_update_commitment_tree(height);
                     }
                 }
@@ -435,21 +433,21 @@ where
                     self.ctx.tx_note_map = nm;
                 }
                 Err(height) => {
-                    self.can_spawn_more_shit()?;
+                    self.can_launch_new_fetch_retry()?;
                     self.spawn_update_tx_notes_map(height);
                 }
             },
             Message::UpdateWitness(witness_map) => match witness_map {
                 Ok(wm) => self.ctx.witness_map = wm,
                 Err(height) => {
-                    self.can_spawn_more_shit()?;
+                    self.can_launch_new_fetch_retry()?;
                     self.spawn_update_witness_map(height);
                 }
             },
             Message::FetchTxs(tx_batch) => match tx_batch {
                 Ok(tx_batch) => {}
                 Err([from, to]) => {
-                    self.can_spawn_more_shit()?;
+                    self.can_launch_new_fetch_retry()?;
                     self.spawn_fetch_tx(from, to);
                 }
             },
@@ -457,16 +455,16 @@ where
                 todo!()
             }
         }
-        std::ops::ControlFlow::Continue(())
+        ControlFlow::Continue(())
     }
 
-    /// check if we can spawn more shit
-    fn can_spawn_more_shit(&mut self) -> std::ops::ControlFlow<()> {
+    /// Check if we can launch a new fetch task retry.
+    fn can_launch_new_fetch_retry(&mut self) -> ControlFlow<()> {
         if matches!(
             self.state,
             DispatcherState::Errored(_) | DispatcherState::Interrupted
         ) {
-            std::ops::ControlFlow::Break(())
+            ControlFlow::Break(())
         } else {
             self.config.retry_strategy.retry()
         }
