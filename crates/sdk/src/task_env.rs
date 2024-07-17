@@ -32,8 +32,9 @@ pub trait TaskEnvironment {
 
 #[cfg(not(target_family = "wasm"))]
 mod environment {
-    use super::*;
     use tokio::task::LocalSet;
+
+    use super::*;
 
     /// Task spawner that uses a [`LocalSet`].
     pub struct LocalSetSpawner {
@@ -57,7 +58,6 @@ mod environment {
             self.pool.spawn(job);
         }
     }
-
 
     /// A task environment that uses a [`LocalSet`].
     pub struct LocalSetTaskEnvironment {

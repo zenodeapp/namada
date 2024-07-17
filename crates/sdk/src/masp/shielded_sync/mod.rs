@@ -1,16 +1,15 @@
-
 use typed_builder::TypedBuilder;
-use crate::masp::ShieldedUtils;
-use crate::masp::shielded_sync::dispatcher::Dispatcher;
-use crate::task_env::{TaskEnvironment, TaskSpawner};
+
 use super::shielded_sync::utils::{MaspClient, RetryStrategy};
+use crate::masp::shielded_sync::dispatcher::Dispatcher;
+use crate::masp::ShieldedUtils;
+use crate::task_env::{TaskEnvironment, TaskSpawner};
 
 pub mod dispatcher;
 pub mod utils;
 
 const DEFAULT_BUF_SIZE: usize = 32;
 const DEFAULT_BATCH_SIZE: usize = 10;
-
 
 #[derive(TypedBuilder)]
 pub struct ShieldedSyncConfig<M> {
@@ -30,10 +29,10 @@ where
     pub async fn dispatcher<U, S>(
         self,
         spawner: S,
-        utils: &U
+        utils: &U,
     ) -> Dispatcher<M, U, S>
     where
-        U: ShieldedUtils
+        U: ShieldedUtils,
     {
         dispatcher::new(
             spawner,
@@ -42,8 +41,8 @@ where
             dispatcher::Config {
                 block_batch_size: self.block_batch_size,
                 channel_buffer_size: self.channel_buffer_size,
-            }
-        ).await
+            },
+        )
+        .await
     }
 }
-

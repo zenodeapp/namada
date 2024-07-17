@@ -11,11 +11,13 @@ use namada_sdk::masp::utils::{
     IndexerMaspClient, LedgerMaspClient, PeekableIter, ProgressTracker,
     ProgressType,
 };
-use namada_sdk::masp::{IndexedNoteEntry, ShieldedContext, ShieldedSyncConfig, ShieldedUtils};
+use namada_sdk::masp::{
+    IndexedNoteEntry, ShieldedContext, ShieldedSyncConfig, ShieldedUtils,
+};
 use namada_sdk::queries::Client;
 use namada_sdk::storage::BlockHeight;
-use namada_sdk::{display, display_line, MaybeSend, MaybeSync};
 use namada_sdk::task_env::LocalSetTaskEnvironment;
+use namada_sdk::{display, display_line, MaybeSend, MaybeSync};
 
 #[allow(clippy::too_many_arguments)]
 pub async fn syncing<
@@ -48,13 +50,9 @@ pub async fn syncing<
     display_line!(io, "\n\n");
     let env = LocalSetTaskEnvironment::new(500)?;
 
-
     macro_rules! dispatch_client {
-        ($client:expr) => {
-            {
-            let config = ShieldedSyncConfig::builder()
-                .client($client)
-                .build();
+        ($client:expr) => {{
+            let config = ShieldedSyncConfig::builder().client($client).build();
             shielded
                 .fetch(
                     env,
@@ -66,8 +64,7 @@ pub async fn syncing<
                 )
                 .await
                 .map(|_| shielded)
-            }
-        };
+        }};
     }
 
     let shielded = if let Some(endpoint) = indexer_addr {

@@ -43,8 +43,8 @@ pub(crate) mod internal_macros;
 pub mod io;
 pub mod migrations;
 pub mod queries;
-pub mod wallet;
 pub mod task_env;
+pub mod wallet;
 
 #[cfg(feature = "async-send")]
 pub use std::marker::Send as MaybeSend;

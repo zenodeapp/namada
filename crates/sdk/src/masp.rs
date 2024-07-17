@@ -72,16 +72,17 @@ use thiserror::Error;
 
 use crate::error::{Error, QueryError};
 use crate::io::Io;
-pub use crate::masp::shielded_sync::{ShieldedSyncConfig, ShieldedSyncConfigBuilder};
-pub use crate::masp::shielded_sync::utils;
 use crate::masp::shielded_sync::utils::MaspClient;
+pub use crate::masp::shielded_sync::{
+    utils, ShieldedSyncConfig, ShieldedSyncConfigBuilder,
+};
 use crate::queries::Client;
 use crate::rpc::{query_conversion, query_denom};
+use crate::task_env::TaskEnvironment;
 use crate::{
     control_flow, display_line, edisplay_line, query_native_token, rpc,
     MaybeSend, MaybeSync, Namada,
 };
-use crate::task_env::TaskEnvironment;
 
 /// Randomness seed for MASP integration tests to build proofs with
 /// deterministic rng.
@@ -440,7 +441,7 @@ pub type TransferDelta = HashMap<Address, MaspChange>;
 pub type TransactionDelta = HashMap<ViewingKey, I128Sum>;
 
 /// Maps a shielded tx to the index of its first output note.
-pub type  TxNoteMap =  BTreeMap<IndexedTx, usize>;
+pub type TxNoteMap = BTreeMap<IndexedTx, usize>;
 
 /// Maps the note index (in the commitment tree) to a witness
 pub type WitnessMap = HashMap<usize, IncrementalWitness<Node>>;
@@ -668,12 +669,10 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
     where
         M: MaspClient + Send + Sync + 'static,
     {
-
         let shutdown_signal = control_flow::install_shutdown_signal();
 
         env.run(|spawner| async move {
-            let dispatcher =
-                config.dispatcher(spawner, &self.utils).await;
+            let dispatcher = config.dispatcher(spawner, &self.utils).await;
 
             dispatcher
                 .run(
@@ -687,8 +686,8 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
 
             self.load().await.map_err(|err| {
                 Error::Other(format!(
-                    "Failed to reload the updated shielded context from \
-                     disk: {err}"
+                    "Failed to reload the updated shielded context from disk: \
+                     {err}"
                 ))
             })
         })

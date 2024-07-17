@@ -19,8 +19,11 @@ use namada_tx::IndexedTx;
 use super::utils::{BlockRange, MaspClient};
 use crate::control_flow::ShutdownSignal;
 use crate::error::Error;
-use crate::masp::{to_viewing_key, DecryptedData, ScannedData, ShieldedContext, ShieldedUtils, Unscanned, WitnessMap, TxNoteMap};
 use crate::masp::utils::RetryStrategy;
+use crate::masp::{
+    to_viewing_key, DecryptedData, ScannedData, ShieldedContext, ShieldedUtils,
+    TxNoteMap, Unscanned, WitnessMap,
+};
 use crate::task_env::TaskSpawner;
 
 struct AsyncCounterInner {
@@ -82,7 +85,6 @@ impl Future for AsyncCounter {
     }
 }
 
-
 #[derive(Clone, Default)]
 struct PanicFlag {
     #[cfg(not(target_family = "wasm"))]
@@ -103,7 +105,6 @@ impl PanicFlag {
     }
 }
 
-
 #[cfg(not(target_family = "wasm"))]
 impl Drop for PanicFlag {
     fn drop(&mut self) {
@@ -116,13 +117,18 @@ impl Drop for PanicFlag {
 pub enum Message {
     UpdateCommitmentTree(Result<CommitmentTree<Node>, BlockHeight>),
     UpdateNotesMap(Result<BTreeMap<IndexedTx, usize>, BlockHeight>),
-    UpdateWitness(Result<HashMap<usize, IncrementalWitness<Node>>, BlockHeight>),
+    UpdateWitness(
+        Result<HashMap<usize, IncrementalWitness<Node>>, BlockHeight>,
+    ),
     FetchTxs(Result<BlockRange, [BlockHeight; 2]>),
     TrialDecrypt(
-        Result<(
-            ScannedData,
-            HashMap<Hash, (IndexedTx, ViewingKey, DecryptedData)>,
-        ), Error>,
+        Result<
+            (
+                ScannedData,
+                HashMap<Hash, (IndexedTx, ViewingKey, DecryptedData)>,
+            ),
+            Error,
+        >,
     ),
 }
 
@@ -152,7 +158,7 @@ impl<Spawner> DispatcherTasks<Spawner> {
 
 pub enum Requested<T> {
     Received(T),
-    Pending(BlockHeight)
+    Pending(BlockHeight),
 }
 
 struct DispatcherCache {
@@ -181,7 +187,6 @@ pub struct Config {
     pub block_batch_size: usize,
     pub channel_buffer_size: usize,
 }
-
 
 pub struct Dispatcher<M, U, S>
 where
@@ -235,7 +240,8 @@ where
         DispatcherState::Normal
     };
 
-    let (message_sender, message_receiver) = flume::bounded(config.channel_buffer_size);
+    let (message_sender, message_receiver) =
+        flume::bounded(config.channel_buffer_size);
 
     let tasks = DispatcherTasks {
         spawner,
@@ -246,9 +252,7 @@ where
     };
 
     // TODO: load cache from file
-    let cache = {
-        todo!()
-    };
+    let cache = { todo!() };
     Dispatcher {
         state,
         ctx,
@@ -375,9 +379,8 @@ where
     }
 
     fn spawn_initial_set_of_tasks(&mut self, initial_state: &InitialState) {
-
         if self.client.capabilities().may_fetch_pre_built_notes_map() {
-           self.spawn_update_tx_notes_map(initial_state.last_query_height);
+            self.spawn_update_tx_notes_map(initial_state.last_query_height);
         }
 
         if self.client.capabilities().may_fetch_pre_built_tree() {
@@ -389,20 +392,29 @@ where
         }
 
         let batch_size = self.config.block_batch_size;
-        for from in (initial_state.start_height.0 .. initial_state.last_query_height.0).step_by(batch_size) {
+        for from in (initial_state.start_height.0
+            ..initial_state.last_query_height.0)
+            .step_by(batch_size)
+        {
             let client = self.client.clone();
-            let to = (from + batch_size as u64).min(initial_state.last_query_height.0);
+            let to = (from + batch_size as u64)
+                .min(initial_state.last_query_height.0);
             self.spawn_async(async move {
                 client
-                    .fetch_shielded_transfers(BlockHeight(from), BlockHeight(to))
+                    .fetch_shielded_transfers(
+                        BlockHeight(from),
+                        BlockHeight(to),
+                    )
                     .await
                     .map(Message::FetchTxs)
             });
         }
     }
 
-    fn handle_incoming_message(&mut self, message: Message) -> std::ops::ControlFlow<()> {
-
+    fn handle_incoming_message(
+        &mut self,
+        message: Message,
+    ) -> std::ops::ControlFlow<()> {
         match message {
             Message::UpdateCommitmentTree(commitment_tree) => {
                 match commitment_tree {
@@ -413,41 +425,32 @@ where
                     }
                 }
             }
-            Message::UpdateNotesMap(notes_map) => {
-                match notes_map {
-                    Ok(nm) => {
-                        if let DispatcherState::WaitingForNotesMap = &self.state {
-                            self.state = DispatcherState::Normal;
-                        }
-                        self.ctx.tx_note_map = nm;
+            Message::UpdateNotesMap(notes_map) => match notes_map {
+                Ok(nm) => {
+                    if let DispatcherState::WaitingForNotesMap = &self.state {
+                        self.state = DispatcherState::Normal;
                     }
-                    Err(height) => {
-                        self.can_spawn_more_shit()?;
-                        self.spawn_update_tx_notes_map(height);
-                    }
+                    self.ctx.tx_note_map = nm;
                 }
-            }
-            Message::UpdateWitness(witness_map) => {
-                match witness_map {
-                    Ok(wm) => self.ctx.witness_map = wm,
-                    Err(height) => {
-                        self.can_spawn_more_shit()?;
-                        self.spawn_update_witness_map(height);
-                    }
+                Err(height) => {
+                    self.can_spawn_more_shit()?;
+                    self.spawn_update_tx_notes_map(height);
                 }
-
-            }
-            Message::FetchTxs(tx_batch) => {
-               match tx_batch {
-                   Ok(tx_batch) => {
-
-                   }
-                   Err([from, to]) => {
-                       self.can_spawn_more_shit()?;
-                       self.spawn_fetch_tx(from , to);
-                   }
-               }
-            }
+            },
+            Message::UpdateWitness(witness_map) => match witness_map {
+                Ok(wm) => self.ctx.witness_map = wm,
+                Err(height) => {
+                    self.can_spawn_more_shit()?;
+                    self.spawn_update_witness_map(height);
+                }
+            },
+            Message::FetchTxs(tx_batch) => match tx_batch {
+                Ok(tx_batch) => {}
+                Err([from, to]) => {
+                    self.can_spawn_more_shit()?;
+                    self.spawn_fetch_tx(from, to);
+                }
+            },
             Message::TrialDecrypt(_decrypted_note_batch) => {
                 todo!()
             }
@@ -457,7 +460,10 @@ where
 
     /// check if we can spawn more shit
     fn can_spawn_more_shit(&mut self) -> std::ops::ControlFlow<()> {
-        if matches!(self.state, DispatcherState::Errored(_) | DispatcherState::Interrupted) {
+        if matches!(
+            self.state,
+            DispatcherState::Errored(_) | DispatcherState::Interrupted
+        ) {
             std::ops::ControlFlow::Break(())
         } else {
             self.config.retry_strategy.retry()
@@ -467,9 +473,7 @@ where
     fn spawn_update_witness_map(&mut self, height: BlockHeight) {
         match self.cache.witness_map.take() {
             Some((h, wm)) if h == height => {
-                self.spawn_async(async move {
-                    Message::UpdateWitness(Ok(wm))
-                })
+                self.spawn_async(async move { Message::UpdateWitness(Ok(wm)) })
             }
             _ => {
                 let client = self.client.clone();
@@ -486,11 +490,9 @@ where
 
     fn spawn_update_commitment_tree(&mut self, height: BlockHeight) {
         match self.cache.commitment_tree.take() {
-            Some((h, ct)) if h == height => {
-                self.spawn_async(async move{
-                    Message::UpdateCommitmentTree(Ok(ct))
-                })
-            }
+            Some((h, ct)) if h == height => self.spawn_async(async move {
+                Message::UpdateCommitmentTree(Ok(ct))
+            }),
             _ => {
                 let client = self.client.clone();
                 self.spawn_async(async move {
@@ -498,7 +500,7 @@ where
                         .fetch_commitment_tree(height)
                         .await
                         .map(Message::UpdateCommitmentTree)
-                        .map_err( | _| height)
+                        .map_err(|_| height)
                 });
             }
         }
@@ -507,9 +509,7 @@ where
     fn spawn_update_tx_notes_map(&mut self, height: BlockHeight) {
         match self.cache.tx_note_map.take() {
             Some((h, nm)) if h == height => {
-                self.spawn_async(async move {
-                    Message::UpdateNotesMap(Ok(nm))
-                })
+                self.spawn_async(async move { Message::UpdateNotesMap(Ok(nm)) })
             }
             _ => {
                 let client = self.client.clone();
@@ -526,7 +526,7 @@ where
 
     fn spawn_fetch_tx(&self, from: BlockHeight, to: BlockHeight) {
         let client = self.client.clone();
-        self.spawn_async( async move {
+        self.spawn_async(async move {
             client
                 .fetch_shielded_transfers(from, to)
                 .await
