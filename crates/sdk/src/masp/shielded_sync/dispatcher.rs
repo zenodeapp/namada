@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::atomic::{self, AtomicBool, AtomicUsize};
 use std::sync::Arc;
@@ -93,6 +92,7 @@ struct PanicFlag {
 }
 
 impl PanicFlag {
+    #[inline(always)]
     fn panicked(&self) -> bool {
         #[cfg(target_family = "wasm")]
         {
@@ -303,9 +303,7 @@ where
 
         match self.state {
             DispatcherState::Errored(err) => Err(err),
-            DispatcherState::Interrupted => {
-                Err(Error::Other("The shielded sync was interrupted".into()))
-            }
+            DispatcherState::Interrupted => Ok(()),
             DispatcherState::WaitingForNotesMap => unreachable!(
                 "All system messages are consumed, so we never finish in this \
                  state"
@@ -423,7 +421,7 @@ where
         }
     }
 
-    fn handle_incoming_message(&mut self, message: Message) -> ControlFlow<()> {
+    fn handle_incoming_message(&mut self, message: Message) {
         match message {
             Message::UpdateCommitmentTree(Ok(ct)) => {
                 self.cache.commitment_tree.insert((self.height_to_sync, ct));
@@ -432,8 +430,9 @@ where
                 error,
                 context: height,
             })) => {
-                self.can_launch_new_fetch_retry()?;
-                self.spawn_update_commitment_tree(height);
+                if self.can_launch_new_fetch_retry() {
+                    self.spawn_update_commitment_tree(height);
+                }
             }
             Message::UpdateNotesMap(Ok(nm)) => {
                 if let DispatcherState::WaitingForNotesMap = &self.state {
@@ -445,8 +444,9 @@ where
                 error,
                 context: height,
             })) => {
-                self.can_launch_new_fetch_retry(error)?;
-                self.spawn_update_tx_notes_map(height);
+                if self.can_launch_new_fetch_retry(error) {
+                    self.spawn_update_tx_notes_map(height);
+                }
             }
             Message::UpdateWitnessMap(Ok(wm)) => {
                 self.cache.witness_map.insert((self.height_to_sync, wm));
@@ -455,8 +455,9 @@ where
                 error,
                 context: height,
             })) => {
-                self.can_launch_new_fetch_retry(error)?;
-                self.spawn_update_witness_map(height);
+                if self.can_launch_new_fetch_retry(error) {
+                    self.spawn_update_witness_map(height);
+                }
             }
             Message::FetchTxs(Ok(_tx_batch)) => {
                 todo!()
@@ -465,8 +466,9 @@ where
                 error,
                 context: [from, to],
             })) => {
-                self.can_launch_new_fetch_retry(error)?;
-                self.spawn_fetch_txs(from, to);
+                if self.can_launch_new_fetch_retry(error) {
+                    self.spawn_fetch_txs(from, to);
+                }
             }
             Message::TrialDecrypt(_decrypted_note_batch) => {
                 todo!()
@@ -476,20 +478,21 @@ where
     }
 
     /// Check if we can launch a new fetch task retry.
-    fn can_launch_new_fetch_retry(&mut self, error: Error) -> ControlFlow<()> {
+    fn can_launch_new_fetch_retry(&mut self, error: Error) -> bool {
         if matches!(
             self.state,
             DispatcherState::Errored(_) | DispatcherState::Interrupted
         ) {
-            return ControlFlow::Break(());
+            return false;
         }
 
-        if self.config.retry_strategy.retry().is_break() {
-            self.state = DispatcherState::Errored(error);
-            ControlFlow::Break(())
-        } else {
+        if self.config.retry_strategy.may_retry() {
             tracing::warn!(reason = %error, "Fetch failure, retrying...");
-            ControlFlow::Continue(())
+            true
+        } else {
+            // NB: store last encountered error
+            self.state = DispatcherState::Errored(error);
+            false
         }
     }
 
