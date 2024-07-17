@@ -460,6 +460,12 @@ where
                 }
             }
             Message::FetchTxs(Ok(_tx_batch)) => {
+                // NOTE: if the client cannot fetch a notes map,
+                // we need to incrementally build it... so we
+                // can't just store things in cache, in those
+                // cases, we also need to update the notes map
+                // in the shielded context, otherwise we won't
+                // be able to start scanning anything
                 todo!()
             }
             Message::FetchTxs(Err(TaskError {
