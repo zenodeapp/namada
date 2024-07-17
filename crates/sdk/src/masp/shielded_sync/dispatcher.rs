@@ -486,6 +486,16 @@ where
                 // in order, and update the commitment
                 // tree, witness map and tx notes map
 
+                // TODO: avoid launching new scan job
+                // if we already have a scanned range
+                // in cache
+
+                // TODO: might be wiser to support a
+                // single scan per received message...
+                // otherwise it will be hard to map
+                // a fetched range (eg: from, to) to
+                // a scanned range
+
                 todo!()
             }
             Message::FetchTxs(Err(TaskError {
