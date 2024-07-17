@@ -168,7 +168,7 @@ struct DispatcherCache {
     pub commitment_tree: Option<(BlockHeight, CommitmentTree<Node>)>,
     pub witness_map: Option<(BlockHeight, WitnessMap)>,
     pub tx_note_map: Option<(BlockHeight, TxNoteMap)>,
-    pub unscanned: Unscanned,
+    pub unscanned: Unscanned, // TODO: Unscanned => FetchedTxs??
 }
 
 #[derive(Debug)]
@@ -299,7 +299,7 @@ where
             self.handle_incoming_message(message);
         }
 
-        // TODO: save cache
+        // TODO: save cache to file
 
         match self.state {
             DispatcherState::Errored(err) => Err(err),
@@ -393,6 +393,7 @@ where
             return;
         }
         if shutdown_signal.received() {
+            tracing::info!("Interrupt received, shutting down shielded sync");
             self.state = DispatcherState::Interrupted;
         }
     }
