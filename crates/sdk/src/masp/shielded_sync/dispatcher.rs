@@ -469,8 +469,6 @@ where
                 }
             }
             Message::FetchTxs(Ok(_tx_batch)) => {
-                todo!()
-
                 // TODO:
                 // - keeps all txs in cache
                 // - keep an unscanned set (doesn't need
@@ -487,6 +485,8 @@ where
                 // need to go through each tx in cache
                 // in order, and update the commitment
                 // tree, witness map and tx notes map
+
+                todo!()
             }
             Message::FetchTxs(Err(TaskError {
                 error,
@@ -499,6 +499,10 @@ where
             Message::TrialDecrypt(_decrypted_note_batch) => {
                 // TODO: pull out these successful trial decryptions
                 // from the set of unscanned block ranges
+
+                // TODO: add the decrypted notes onto
+                // a new cache entry
+
                 todo!()
             }
         }
