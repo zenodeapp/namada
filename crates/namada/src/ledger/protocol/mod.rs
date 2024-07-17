@@ -544,12 +544,15 @@ where
             )
             .map_err(Error::StorageError)?;
 
+            #[cfg(not(fuzzing))]
             let balance = crate::token::read_balance(
                 shell_params.state,
                 &wrapper.fee.token,
                 &wrapper.fee_payer(),
             )
             .map_err(Error::StorageError)?;
+            #[cfg(fuzzing)]
+            let balance = Amount::from_u64(1_000_000);
 
             let (post_bal, valid_batched_tx_result) = if let Some(post_bal) =
                 balance.checked_sub(fees)
@@ -569,12 +572,15 @@ where
                 if let Ok(Some(valid_batched_tx_result)) =
                     try_masp_fee_payment(shell_params, tx, tx_index)
                 {
+                    #[cfg(not(fuzzing))]
                     let balance = crate::token::read_balance(
                         shell_params.state,
                         &wrapper.fee.token,
                         &wrapper.fee_payer(),
                     )
                     .expect("Could not read balance key from storage");
+                    #[cfg(fuzzing)]
+                    let balance = Amount::from_u64(1_000_000);
 
                     let post_bal = match balance.checked_sub(fees) {
                         Some(post_bal) => {
