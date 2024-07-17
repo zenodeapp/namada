@@ -19,10 +19,10 @@ use namada_tx::IndexedTx;
 use super::utils::{BlockRange, MaspClient};
 use crate::control_flow::ShutdownSignal;
 use crate::error::Error;
-use crate::masp::utils::RetryStrategy;
+use crate::masp::utils::{RetryStrategy, Unscanned};
 use crate::masp::{
     to_viewing_key, DecryptedData, ScannedData, ShieldedContext, ShieldedUtils,
-    TxNoteMap, Unscanned, WitnessMap,
+    TxNoteMap, WitnessMap,
 };
 use crate::task_env::TaskSpawner;
 

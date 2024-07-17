@@ -15,9 +15,91 @@ use crate::error::{Error, QueryError};
 use crate::io::Io;
 use crate::masp::{
     extract_masp_tx, extract_masp_tx_from_ibc_message,
-    get_indexed_masp_events_at_height, IndexedNoteEntry,
+    get_indexed_masp_events_at_height,
 };
 use crate::queries::Client;
+
+/// Type alias for convenience and profit
+pub type IndexedNoteData = BTreeMap<IndexedTx, Vec<Transaction>>;
+
+/// Type alias for the entries of [`IndexedNoteData`] iterators
+pub type IndexedNoteEntry = (IndexedTx, Vec<Transaction>);
+
+/// A cache of fetched indexed transactions.
+///
+/// An invariant that shielded-sync maintains is that
+/// this cache either contains all transactions from
+/// a given height, or none.
+#[derive(Debug, Default, Clone, BorshSerialize, BorshDeserialize)]
+pub struct Unscanned {
+    txs: IndexedNoteData,
+}
+
+impl Unscanned {
+    /// Append elements to the cache from an iterator.
+    pub fn extend<I>(&mut self, items: I)
+    where
+        I: IntoIterator<Item = IndexedNoteEntry>,
+    {
+        self.txs.extend(items);
+    }
+
+    /// Add a single entry to the cache.
+    pub fn insert(&mut self, (k, v): IndexedNoteEntry) {
+        self.txs.insert(k, v);
+    }
+
+    /// Check if this cache has already been populated for a given
+    /// block height.
+    pub fn contains_height(&self, height: u64) -> bool {
+        self.txs.keys().any(|k| k.height.0 == height)
+    }
+
+    /// We remove all indices from blocks that have been entirely scanned.
+    /// If a block is only partially scanned, we leave all the events in the
+    /// cache.
+    pub fn scanned(&mut self, ix: &IndexedTx) {
+        self.txs.retain(|i, _| i.height >= ix.height);
+    }
+
+    /// Gets the latest block height present in the cache
+    pub fn latest_height(&self) -> BlockHeight {
+        self.txs
+            .keys()
+            .max_by_key(|ix| ix.height)
+            .map(|ix| ix.height)
+            .unwrap_or_default()
+    }
+
+    /// Gets the first block height present in the cache
+    pub fn first_height(&self) -> BlockHeight {
+        self.txs
+            .keys()
+            .min_by_key(|ix| ix.height)
+            .map(|ix| ix.height)
+            .unwrap_or_default()
+    }
+
+    /// Remove the first entry from the cache and return it.
+    pub fn pop_first(&mut self) -> Option<IndexedNoteEntry> {
+        self.txs.pop_first()
+    }
+
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.txs.is_empty()
+    }
+}
+
+impl IntoIterator for Unscanned {
+    type IntoIter = <IndexedNoteData as IntoIterator>::IntoIter;
+    type Item = IndexedNoteEntry;
+
+    fn into_iter(mut self) -> Self::IntoIter {
+        let txs = std::mem::take(&mut self.txs);
+        txs.into_iter()
+    }
+}
 
 /// When retrying to fetch all notes in a
 /// loop, this dictates the strategy for
