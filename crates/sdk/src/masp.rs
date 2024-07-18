@@ -711,7 +711,7 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
             let tx_data = tx.data(cmt).ok_or_else(|| {
                 Error::Other("Missing transaction data".to_string())
             })?;
-            let ibc_msg = decode_message(&tx_data)
+            let ibc_msg = decode_message::<token::Transfer>(&tx_data)
                 .map_err(|_| Error::Other("Invalid IBC message".to_string()))?;
             if let IbcMessage::Envelope(ref envelope) = ibc_msg {
                 if let Some(masp_tx) = extract_masp_tx_from_envelope(envelope) {

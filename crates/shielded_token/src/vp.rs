@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 
+use borsh::BorshDeserialize;
 use masp_primitives::asset_type::AssetType;
 use masp_primitives::merkle_tree::CommitmentTree;
 use masp_primitives::sapling::Node;
@@ -49,7 +50,7 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// MASP VP
-pub struct MaspVp<'ctx, S, CA, EVAL, Params, Gov, Ibc, TransToken>
+pub struct MaspVp<'ctx, S, CA, EVAL, Params, Gov, Ibc, TransToken, Transfer>
 where
     S: 'static + StateRead,
     EVAL: VpEvaluator<'ctx, S, CA, EVAL>,
@@ -57,7 +58,7 @@ where
     /// Context to interact with the host structures.
     pub ctx: Ctx<'ctx, S, CA, EVAL>,
     /// Generic types for DI
-    pub _marker: PhantomData<(Params, Gov, Ibc, TransToken)>,
+    pub _marker: PhantomData<(Params, Gov, Ibc, TransToken, Transfer)>,
 }
 
 // The balances changed by the transaction, split between masp and non-masp
@@ -73,8 +74,8 @@ struct ChangedBalances {
     post: BTreeMap<TransparentAddress, ValueSum<Address, Amount>>,
 }
 
-impl<'view, 'ctx: 'view, S, CA, EVAL, Params, Gov, Ibc, TransToken>
-    MaspVp<'ctx, S, CA, EVAL, Params, Gov, Ibc, TransToken>
+impl<'view, 'ctx: 'view, S, CA, EVAL, Params, Gov, Ibc, TransToken, Transfer>
+    MaspVp<'ctx, S, CA, EVAL, Params, Gov, Ibc, TransToken, Transfer>
 where
     S: 'static + StateRead,
     CA: 'static + Clone,
@@ -84,6 +85,7 @@ where
     Ibc: ibc::Read<CtxPostStorageRead<'view, 'ctx, S, CA, EVAL>>,
     TransToken: trans_token::Keys
         + trans_token::Read<CtxPreStorageRead<'view, 'ctx, S, CA, EVAL>>,
+    Transfer: BorshDeserialize,
 {
     /// Instantiate MASP VP
     pub fn new(ctx: Ctx<'ctx, S, CA, EVAL>) -> Self {
@@ -380,7 +382,7 @@ where
             post,
         } = changed_balances;
         let ibc::ChangedBalances { decoder, pre, post } =
-            Ibc::apply_ibc_packet(
+            Ibc::apply_ibc_packet::<Transfer>(
                 &self.ctx.post(),
                 tx_data,
                 ibc::ChangedBalances { decoder, pre, post },
@@ -415,7 +417,7 @@ where
             .data(batched_tx.cmt)
             .ok_or_err_msg("No transaction data")?;
         let shielded_tx = if let Some(tx) =
-            Ibc::try_extract_masp_tx_from_envelope(&tx_data)?
+            Ibc::try_extract_masp_tx_from_envelope::<Transfer>(&tx_data)?
         {
             tx
         } else {
@@ -882,8 +884,9 @@ fn verify_sapling_balancing_value(
     }
 }
 
-impl<'view, 'ctx: 'view, S, CA, EVAL, Params, Gov, Ibc, TransToken>
-    NativeVp<'view> for MaspVp<'ctx, S, CA, EVAL, Params, Gov, Ibc, TransToken>
+impl<'view, 'ctx: 'view, S, CA, EVAL, Params, Gov, Ibc, TransToken, Transfer>
+    NativeVp<'view>
+    for MaspVp<'ctx, S, CA, EVAL, Params, Gov, Ibc, TransToken, Transfer>
 where
     S: 'static + StateRead,
     CA: 'static + Clone,
@@ -893,6 +896,7 @@ where
     Ibc: ibc::Read<CtxPostStorageRead<'view, 'ctx, S, CA, EVAL>>,
     TransToken: trans_token::Keys
         + trans_token::Read<CtxPreStorageRead<'view, 'ctx, S, CA, EVAL>>,
+    Transfer: BorshDeserialize,
 {
     type Error = Error;
 
