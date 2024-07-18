@@ -24,5 +24,7 @@ fuzz_target!(|txs: Vec<Tx>| {
     }
 
     let req = ProcessProposal { txs: txs_bytes };
-    SHELL.process_proposal(req).unwrap();
+    // An err means that the proposal was rejected, which is fine. We're only
+    // looking for crashes here
+    let _res = SHELL.process_proposal(req);
 });
