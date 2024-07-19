@@ -9,9 +9,9 @@ use futures::future::{select, Either};
 use futures::task::AtomicWaker;
 use masp_primitives::merkle_tree::{CommitmentTree, IncrementalWitness};
 use masp_primitives::sapling::{Node, ViewingKey};
+use masp_primitives::transaction::Transaction;
 use masp_primitives::zip32::ExtendedSpendingKey;
 use namada_core::collections::HashMap;
-use namada_core::hash::Hash;
 use namada_core::hints;
 use namada_core::storage::BlockHeight;
 use namada_tx::IndexedTx;
@@ -19,10 +19,12 @@ use namada_tx::IndexedTx;
 use super::utils::{MaspClient, TxsInBlockRange};
 use crate::control_flow::ShutdownSignal;
 use crate::error::Error;
-use crate::masp::utils::{RetryStrategy, Unscanned};
+use crate::masp::shielded_sync::trial_decrypt;
+use crate::masp::utils::{
+    range_gaps, DecryptedData, Fetched, RetryStrategy, TrialDecrypted,
+};
 use crate::masp::{
-    to_viewing_key, DecryptedData, ScannedData, ShieldedContext, ShieldedUtils,
-    TxNoteMap, WitnessMap,
+    to_viewing_key, ShieldedContext, ShieldedUtils, TxNoteMap, WitnessMap,
 };
 use crate::task_env::TaskSpawner;
 
@@ -86,9 +88,24 @@ impl Future for AsyncCounter {
 }
 
 #[derive(Clone, Default)]
+pub struct AtomicFlag {
+    inner: Arc<AtomicBool>,
+}
+
+impl AtomicFlag {
+    pub fn set(&self) {
+        self.inner.store(true, atomic::Ordering::Relaxed)
+    }
+
+    pub fn get(&self) -> bool {
+        self.inner.load(atomic::Ordering::Relaxed)
+    }
+}
+
+#[derive(Clone, Default)]
 struct PanicFlag {
     #[cfg(not(target_family = "wasm"))]
-    inner: Arc<AtomicBool>,
+    inner: AtomicFlag,
 }
 
 impl PanicFlag {
@@ -101,7 +118,7 @@ impl PanicFlag {
 
         #[cfg(not(target_family = "wasm"))]
         {
-            self.inner.load(atomic::Ordering::Relaxed)
+            self.inner.get()
         }
     }
 }
@@ -110,7 +127,7 @@ impl PanicFlag {
 impl Drop for PanicFlag {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            self.inner.store(true, atomic::Ordering::Relaxed);
+            self.inner.set();
         }
     }
 }
@@ -124,19 +141,13 @@ enum Message {
     UpdateCommitmentTree(Result<CommitmentTree<Node>, TaskError<BlockHeight>>),
     UpdateNotesMap(Result<BTreeMap<IndexedTx, usize>, TaskError<BlockHeight>>),
     UpdateWitnessMap(
-        Result<HashMap<usize, IncrementalWitness<Node>>, BlockHeight>,
-    ),
-    FetchTxs(Result<TxsInBlockRange, TaskError<[BlockHeight; 2]>>),
-    TrialDecrypt(
         Result<
-            (
-                ScannedData,
-                HashMap<Hash, (IndexedTx, ViewingKey, DecryptedData)>,
-            ),
-            // TODO: change this context type to smth else
-            TaskError<()>,
+            HashMap<usize, IncrementalWitness<Node>>,
+            TaskError<BlockHeight>,
         >,
     ),
+    FetchTxs(Result<TxsInBlockRange, TaskError<[BlockHeight; 2]>>),
+    TrialDecrypt(IndexedTx, ViewingKey, Vec<DecryptedData>),
 }
 
 struct DispatcherTasks<Spawner> {
@@ -168,13 +179,13 @@ struct DispatcherCache {
     pub commitment_tree: Option<(BlockHeight, CommitmentTree<Node>)>,
     pub witness_map: Option<(BlockHeight, WitnessMap)>,
     pub tx_note_map: Option<(BlockHeight, TxNoteMap)>,
-    pub unscanned: Unscanned, // TODO: Unscanned => FetchedTxs??
+    pub fetched: Fetched,
+    pub trial_decrypted: TrialDecrypted,
 }
 
 #[derive(Debug)]
 enum DispatcherState {
     Normal,
-    WaitingForNotesMap,
     Interrupted,
     Errored(Error),
 }
@@ -201,7 +212,9 @@ where
     ctx: ShieldedContext<U>,
     config: Config,
     cache: DispatcherCache,
+    /// We are syncing up to this height
     height_to_sync: BlockHeight,
+    interrupt_flag: AtomicFlag,
 }
 
 /// Create a new dispatcher in the initial state.
@@ -215,7 +228,6 @@ pub async fn new<S, M, U>(
     config: Config,
 ) -> Dispatcher<M, U, S>
 where
-    M: MaspClient,
     U: ShieldedUtils,
 {
     let ctx = {
@@ -237,15 +249,7 @@ where
         ctx
     };
 
-    let state = if client.capabilities().may_fetch_pre_built_notes_map() {
-        // NB: if the client can fetch a pre-built notes map,
-        // it won't build its own notes map, which means that
-        // scanning will be delayed by completion of the notes
-        // map fetch operation.
-        DispatcherState::WaitingForNotesMap
-    } else {
-        DispatcherState::Normal
-    };
+    let state = DispatcherState::Normal;
 
     let (message_sender, message_receiver) =
         flume::bounded(config.channel_buffer_size);
@@ -271,12 +275,13 @@ where
         cache,
         // TODO: add progress tracking mechanism to
         // `handle_incoming_message`
+        interrupt_flag: Default::default(),
     }
 }
 
 impl<M, U, S> Dispatcher<M, U, S>
 where
-    M: MaspClient + Send + Sync + 'static,
+    M: MaspClient + Send + Sync + Unpin + 'static,
     U: ShieldedUtils,
     S: TaskSpawner,
 {
@@ -307,10 +312,6 @@ where
         match self.state {
             DispatcherState::Errored(err) => Err(err),
             DispatcherState::Interrupted => Ok(()),
-            DispatcherState::WaitingForNotesMap => unreachable!(
-                "All system messages are consumed, so we never finish in this \
-                 state"
-            ),
             DispatcherState::Normal => {
                 // TODO: load shielded context at this stage
 
@@ -423,7 +424,6 @@ where
             ..=initial_state.last_query_height.0)
             .step_by(batch_size)
         {
-            let client = self.client.clone();
             let to = (from + batch_size as u64)
                 .min(initial_state.last_query_height.0);
             self.spawn_fetch_txs(BlockHeight(from), BlockHeight(to));
@@ -433,21 +433,21 @@ where
     fn handle_incoming_message(&mut self, message: Message) {
         match message {
             Message::UpdateCommitmentTree(Ok(ct)) => {
-                self.cache.commitment_tree.insert((self.height_to_sync, ct));
+                _ = self
+                    .cache
+                    .commitment_tree
+                    .insert((self.height_to_sync, ct));
             }
             Message::UpdateCommitmentTree(Err(TaskError {
                 error,
                 context: height,
             })) => {
-                if self.can_launch_new_fetch_retry() {
+                if self.can_launch_new_fetch_retry(error) {
                     self.spawn_update_commitment_tree(height);
                 }
             }
             Message::UpdateNotesMap(Ok(nm)) => {
-                if let DispatcherState::WaitingForNotesMap = &self.state {
-                    self.state = DispatcherState::Normal;
-                }
-                self.cache.tx_note_map.insert((self.height_to_sync, ct));
+                _ = self.cache.tx_note_map.insert((self.height_to_sync, nm));
             }
             Message::UpdateNotesMap(Err(TaskError {
                 error,
@@ -458,7 +458,7 @@ where
                 }
             }
             Message::UpdateWitnessMap(Ok(wm)) => {
-                self.cache.witness_map.insert((self.height_to_sync, wm));
+                _ = self.cache.witness_map.insert((self.height_to_sync, wm));
             }
             Message::UpdateWitnessMap(Err(TaskError {
                 error,
@@ -468,35 +468,11 @@ where
                     self.spawn_update_witness_map(height);
                 }
             }
-            Message::FetchTxs(Ok(_tx_batch)) => {
-                // TODO:
-                // - keeps all txs in cache
-                // - keep an unscanned set (doesn't need
-                // to be ordered), which simply stores
-                // block ranges (from, to)
-                //   - to scan new txs, we pull block
-                //   ranges from the set
-                //   - trial decryptions don't have any
-                //   ordering constraints, we just need
-                //   a viewing key and a sapling note
-                //   (shielded output) as inputs to the
-                //   trial decryption
-                // - at the end of the algorithm, we
-                // need to go through each tx in cache
-                // in order, and update the commitment
-                // tree, witness map and tx notes map
-
-                // TODO: avoid launching new scan job
-                // if we already have a scanned range
-                // in cache
-
-                // TODO: might be wiser to support a
-                // single scan per received message...
-                // otherwise it will be hard to map
-                // a fetched range (eg: from, to) to
-                // a scanned range
-
-                todo!()
+            Message::FetchTxs(Ok(tx_batch)) => {
+                for (itx, txs) in &tx_batch.txs {
+                    self.spawn_trial_decryptions(*itx, txs);
+                }
+                self.cache.fetched.extend(tx_batch.txs);
             }
             Message::FetchTxs(Err(TaskError {
                 error,
@@ -506,17 +482,10 @@ where
                     self.spawn_fetch_txs(from, to);
                 }
             }
-            Message::TrialDecrypt(_decrypted_note_batch) => {
-                // TODO: pull out these successful trial decryptions
-                // from the set of unscanned block ranges
-
-                // TODO: add the decrypted notes onto
-                // a new cache entry
-
-                todo!()
+            Message::TrialDecrypt(itx, vk, decrypted_data) => {
+                self.cache.trial_decrypted.insert(itx, vk, decrypted_data);
             }
         }
-        ControlFlow::Continue(())
     }
 
     /// Check if we can launch a new fetch task retry.
@@ -541,20 +510,19 @@ where
     fn spawn_update_witness_map(&mut self, height: BlockHeight) {
         match self.cache.witness_map.take() {
             Some((h, wm)) if h == height => {
-                self.spawn_sync(move || Message::UpdateWitnessMap(Ok(wm)))
+                self.spawn_sync(move |_| Message::UpdateWitnessMap(Ok(wm)))
             }
             _ => {
                 let client = self.client.clone();
-                self.spawn_async(async move {
-                    client
+                self.spawn_async(Box::pin(async move {
+                    Message::UpdateWitnessMap(client
                         .fetch_witness_map(height)
                         .await
-                        .map(Message::UpdateWitnessMap)
                         .map_err(|error| TaskError {
                             error,
                             context: height,
-                        })
-                })
+                        }))
+                }))
             }
         }
     }
@@ -562,17 +530,19 @@ where
     fn spawn_update_commitment_tree(&mut self, height: BlockHeight) {
         match self.cache.commitment_tree.take() {
             Some((h, ct)) if h == height => {
-                self.spawn_sync(move || Message::UpdateCommitmentTree(Ok(ct)))
+                self.spawn_sync(move |_| Message::UpdateCommitmentTree(Ok(ct)))
             }
             _ => {
                 let client = self.client.clone();
-                self.spawn_async(async move {
-                    client
+                self.spawn_async(Box::pin(async move {
+                    Message::UpdateCommitmentTree(client
                         .fetch_commitment_tree(height)
                         .await
-                        .map(Message::UpdateCommitmentTree)
-                        .map_err(|_| height)
-                });
+                        .map_err(|error| TaskError {
+                            error,
+                            context: height
+                        }))
+                }));
             }
         }
     }
@@ -580,67 +550,107 @@ where
     fn spawn_update_tx_notes_map(&mut self, height: BlockHeight) {
         match self.cache.tx_note_map.take() {
             Some((h, nm)) if h == height => {
-                self.spawn_sync(move || Message::UpdateNotesMap(Ok(nm)))
+                self.spawn_sync(move |_| Message::UpdateNotesMap(Ok(nm)))
             }
             _ => {
                 let client = self.client.clone();
-                self.spawn_async(async move {
-                    client
+                self.spawn_async(Box::pin(async move {
+                    Message::UpdateNotesMap(client
                         .fetch_tx_notes_map(height)
                         .await
-                        .map(Message::UpdateNotesMap)
                         .map_err(|error| TaskError {
                             error,
                             context: height,
-                        })
-                });
+                        }))
+                }));
             }
         }
     }
 
     fn spawn_fetch_txs(&self, from: BlockHeight, to: BlockHeight) {
-        let client = self.client.clone();
-        self.spawn_async(async move {
-            client
-                .fetch_shielded_transfers(from, to)
-                .await
-                .map(Message::FetchTxs)
-                .map_err(|error| TaskError {
-                    error,
-                    context: [from, to],
-                })
-        })
+        for [from, to] in range_gaps(from, to, &self.cache.fetched) {
+            let client = self.client.clone();
+            self.spawn_async(Box::pin(async move {
+                Message::FetchTxs(
+                    client.fetch_shielded_transfers(from, to).await.map_err(
+                        |error| TaskError {
+                            error,
+                            context: [from, to],
+                        },
+                    ),
+                )
+            }));
+        }
     }
 
-    fn spawn_async<F>(&self, fut: F)
+    fn spawn_trial_decryptions(&self, itx: IndexedTx, txs: &[Transaction]) {
+        for tx in txs {
+            for vk in self.ctx.vk_heights.keys() {
+                if let Some(decrypted_data) =
+                    self.cache.trial_decrypted.get(&itx, &vk)
+                {
+                    let dd = decrypted_data.clone();
+                    let vk_cloned = vk.clone();
+                    self.spawn_sync(move |_| {
+                        Message::TrialDecrypt(
+                            itx,
+                            vk_cloned,
+                            dd,
+                        )
+                    })
+                } else {
+                    let tx = tx.clone();
+                    let vk_cloned = vk.clone();
+                    self.spawn_sync(move |interrupt| {
+                        Message::TrialDecrypt(
+                            itx,
+                            vk_cloned.clone(),
+                            trial_decrypt(tx, vk_cloned, interrupt),
+                        )
+                    })
+                }
+            }
+        }
+    }
+
+    fn spawn_async<F>(&self, mut fut: F)
     where
-        F: Future<Output = Message> + 'static,
+        F: Future<Output = Message> + Unpin + 'static,
     {
         let sender = self.tasks.message_sender.clone();
         let guard = (
             self.tasks.active_tasks.clone(),
             self.tasks.panic_flag.clone(),
         );
-
+        let interrupt = self.interrupt_flag.clone();
         self.tasks.spawner.spawn_async(async move {
             let _guard = guard;
-            sender.send_async(fut.await).await.unwrap();
+            let wrapped_fut = std::future::poll_fn(move |cx| {
+                if interrupt.get() {
+                    Poll::Ready(None)
+                } else {
+                    Pin::new(&mut fut).poll(cx).map(Some)
+                }
+            });
+            if let Some(msg) = wrapped_fut.await {
+                sender.send_async(msg).await.unwrap()
+            }
         });
     }
 
     fn spawn_sync<F>(&self, job: F)
     where
-        F: FnOnce() -> Message + Send + 'static,
+        F: FnOnce(AtomicFlag) -> Message + Send + 'static,
     {
         let sender = self.tasks.message_sender.clone();
         let guard = (
             self.tasks.active_tasks.clone(),
             self.tasks.panic_flag.clone(),
         );
-
+        let interrupt = self.interrupt_flag.clone();
         self.tasks.spawner.spawn_sync(move || {
             let _guard = guard;
-            sender.send(job()).unwrap();
+            sender.send(job(interrupt)).unwrap();
         });
     }
 }

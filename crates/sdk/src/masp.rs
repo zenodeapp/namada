@@ -91,86 +91,6 @@ pub const ENV_VAR_MASP_TEST_SEED: &str = "NAMADA_MASP_TEST_SEED";
 /// The network to use for MASP
 const NETWORK: Network = Network;
 
-/// Data returned by successfully scanning a tx
-///
-/// This is append-only data that will be applied to
-/// the shielded context via a [`Dispatcher`]
-#[derive(Debug, Clone, Default)]
-struct ScannedData {
-    pub div_map: HashMap<usize, Diversifier>,
-    pub memo_map: HashMap<usize, MemoBytes>,
-    pub note_map: HashMap<usize, Note>,
-    pub nf_map: HashMap<Nullifier, usize>,
-    pub pos_map: HashMap<ViewingKey, BTreeSet<usize>>,
-    pub vk_map: HashMap<usize, ViewingKey>,
-}
-
-impl ScannedData {
-    /// Append `self` to a [`ShieldedContext`]
-    pub fn apply_to<U: ShieldedUtils>(mut self, ctx: &mut ShieldedContext<U>) {
-        for (k, v) in self.note_map.drain(..) {
-            ctx.note_map.insert(k, v);
-        }
-        for (k, v) in self.nf_map.drain(..) {
-            ctx.nf_map.insert(k, v);
-        }
-        for (k, v) in self.pos_map.drain(..) {
-            let map = ctx.pos_map.entry(k).or_default();
-            for ix in v {
-                map.insert(ix);
-            }
-        }
-        for (k, v) in self.div_map.drain(..) {
-            ctx.div_map.insert(k, v);
-        }
-        for (k, v) in self.vk_map.drain(..) {
-            ctx.vk_map.insert(k, v);
-        }
-        for (k, v) in self.memo_map.drain(..) {
-            ctx.memo_map.insert(k, v);
-        }
-    }
-
-    /// Merge two different instance of `Self`.
-    pub fn merge(&mut self, mut other: Self) {
-        for (k, v) in other.note_map.drain(..) {
-            self.note_map.insert(k, v);
-        }
-        for (k, v) in other.nf_map.drain(..) {
-            self.nf_map.insert(k, v);
-        }
-        for (k, v) in other.pos_map.drain(..) {
-            let map = self.pos_map.entry(k).or_default();
-            for ix in v {
-                map.insert(ix);
-            }
-        }
-        for (k, v) in other.div_map.drain(..) {
-            self.div_map.insert(k, v);
-        }
-        for (k, v) in other.vk_map.drain(..) {
-            self.vk_map.insert(k, v);
-        }
-        for (k, v) in other.memo_map.drain(..) {
-            self.memo_map.insert(k, v);
-        }
-    }
-}
-
-/// Data extracted from a successfully decrypted MASP note
-///
-/// These will be cached until the trial-decryption phase
-/// of shielded-sync has finished. Then they will be
-/// re-scanned as part of nullifying spent notes (which
-/// is not parallelizable).
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct DecryptedData {
-    /// The actual transaction
-    pub txs: Vec<Transaction>,
-    /// balance changes from the tx
-    pub delta: TransactionDelta,
-}
-
 /// Shielded transfer
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize, BorshDeserializer)]
 pub struct ShieldedTransfer {
@@ -582,7 +502,7 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
         fvks: &[ViewingKey],
     ) -> Result<(), Error>
     where
-        M: MaspClient + Send + Sync + 'static,
+        M: MaspClient + Send + Sync + Unpin + 'static,
     {
         let shutdown_signal = control_flow::install_shutdown_signal();
 

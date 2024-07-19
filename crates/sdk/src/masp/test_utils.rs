@@ -14,11 +14,7 @@ use tendermint_rpc::SimpleRequest;
 
 use crate::error::Error;
 use crate::io::Io;
-use crate::masp::utils::{
-    IterProgress, MaspClient, MaspClientCapabilities, PeekableIter,
-    ProgressTracker, TxsInBlockRange,
-};
-use crate::masp::IndexedNoteEntry;
+use crate::masp::utils::{IndexedNoteEntry, IterProgress, MaspClient, MaspClientCapabilities, PeekableIter, ProgressTracker, TxsInBlockRange};
 use crate::queries::testing::TestClient;
 use crate::queries::{Client, EncodedResponseQuery, Rpc, RPC};
 
@@ -338,7 +334,7 @@ impl<'io, IO: Io> ProgressTracker<IO> for TestUnscannedTracker<'io, IO> {
             let mut locked = self.progress.lock().unwrap();
             locked.length = items.size_hint().0;
         }
-        crate::masp::utils::DefaultFetchIterator {
+        crate::masp::shielded_sync::utils::DefaultFetchIterator {
             inner: items,
             progress: self.progress.clone(),
             peeked: None,

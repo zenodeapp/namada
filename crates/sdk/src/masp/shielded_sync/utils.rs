@@ -4,9 +4,11 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::{Arc, Mutex};
 
-use borsh::BorshDeserialize;
+use borsh::{BorshDeserialize, BorshSerialize};
+use masp_primitives::memo::MemoBytes;
 use masp_primitives::merkle_tree::{CommitmentTree, IncrementalWitness};
-use masp_primitives::sapling::Node;
+use masp_primitives::sapling::{Node, Note, PaymentAddress, ViewingKey};
+use masp_primitives::transaction::Transaction;
 use namada_core::collections::HashMap;
 use namada_core::storage::{BlockHeight, TxIndex};
 use namada_tx::{IndexedTx, Tx};
@@ -25,17 +27,43 @@ pub type IndexedNoteData = BTreeMap<IndexedTx, Vec<Transaction>>;
 /// Type alias for the entries of [`IndexedNoteData`] iterators
 pub type IndexedNoteEntry = (IndexedTx, Vec<Transaction>);
 
+pub type DecryptedData = (Note, PaymentAddress, MemoBytes);
+
+#[derive(Default)]
+pub struct TrialDecrypted {
+    inner: HashMap<IndexedTx, HashMap<ViewingKey, Vec<DecryptedData>>>,
+}
+
+impl TrialDecrypted {
+    pub fn get(
+        &self,
+        itx: &IndexedTx,
+        vk: &ViewingKey,
+    ) -> Option<&Vec<DecryptedData>> {
+        self.inner.get(itx).and_then(|h| h.get(vk))
+    }
+
+    pub fn insert(
+        &mut self,
+        itx: IndexedTx,
+        vk: ViewingKey,
+        value: Vec<DecryptedData>,
+    ) {
+        self.inner.entry(itx).or_default().insert(vk, value);
+    }
+}
+
 /// A cache of fetched indexed transactions.
 ///
 /// An invariant that shielded-sync maintains is that
 /// this cache either contains all transactions from
 /// a given height, or none.
 #[derive(Debug, Default, Clone, BorshSerialize, BorshDeserialize)]
-pub struct Unscanned {
+pub struct Fetched {
     txs: IndexedNoteData,
 }
 
-impl Unscanned {
+impl Fetched {
     /// Append elements to the cache from an iterator.
     pub fn extend<I>(&mut self, items: I)
     where
@@ -91,7 +119,7 @@ impl Unscanned {
     }
 }
 
-impl IntoIterator for Unscanned {
+impl IntoIterator for Fetched {
     type IntoIter = <IndexedNoteData as IntoIterator>::IntoIter;
     type Item = IndexedNoteEntry;
 
@@ -777,6 +805,37 @@ impl FetchedTxs {
     }
 }
 
+/// Given a block height range we wish to request and a cache of fetched block
+/// heights, returns the set of ranges we need to request so that all block in
+/// [from, to] get cached.
+pub fn range_gaps(
+    from: BlockHeight,
+    to: BlockHeight,
+    fetched: &Fetched,
+) -> Vec<[BlockHeight; 2]> {
+    let mut to_fetch = Vec::with_capacity((to.0 - from.0 + 1) as usize);
+    let mut current_from = from;
+    let mut need_to_fetch = true;
+
+    for height in from.0..=to.0 {
+        // cross an upper gap boundary
+        if need_to_fetch && fetched.contains_height(height) {
+            if height > current_from.0 {
+                to_fetch.push([current_from, BlockHeight(height - 1)]);
+            }
+            need_to_fetch = false;
+        } else if !need_to_fetch && !fetched.contains_height(height) {
+            // cross a lower gap boundary
+            current_from = height.into();
+            need_to_fetch = true;
+        }
+    }
+    if need_to_fetch {
+        to_fetch.push([current_from, to]);
+    }
+    to_fetch
+}
+
 /// An enum to indicate how to track progress depending on
 /// whether sync is currently fetch or scanning blocks.
 #[derive(Debug, Copy, Clone)]
@@ -856,12 +915,12 @@ impl<'io, IO: Io> DefaultTracker<'io, IO> {
 }
 
 #[derive(Default, Copy, Clone, Debug)]
-pub(super) struct IterProgress {
+pub( in crate::masp) struct IterProgress {
     pub index: usize,
     pub length: usize,
 }
 
-pub(super) struct DefaultFetchIterator<I>
+pub(in crate::masp) struct DefaultFetchIterator<I>
 where
     I: Iterator<Item = u64>,
 {
@@ -924,17 +983,3 @@ impl<'io, IO: Io> ProgressTracker<IO> for DefaultTracker<'io, IO> {
     }
 }
 
-#[cfg(test)]
-mod util_tests {
-    use crate::masp::utils::RetryStrategy;
-
-    #[test]
-    fn test_retry_strategy() {
-        let strategy = RetryStrategy::Times(3);
-        let mut counter = 0;
-        for _ in strategy {
-            counter += 1;
-        }
-        assert_eq!(counter, 3);
-    }
-}
