@@ -551,8 +551,11 @@ where
                 &wrapper.fee_payer(),
             )
             .map_err(Error::StorageError)?;
+
+            // Use half of the max value to make the balance check pass
+            // sometimes with arbitrary fees
             #[cfg(fuzzing)]
-            let balance = Amount::from_u64(1_000_000);
+            let balance = Amount::max().checked_div_u64(2).unwrap();
 
             let (post_bal, valid_batched_tx_result) = if let Some(post_bal) =
                 balance.checked_sub(fees)
