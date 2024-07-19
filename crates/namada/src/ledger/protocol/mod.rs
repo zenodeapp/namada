@@ -583,7 +583,7 @@ where
                     )
                     .expect("Could not read balance key from storage");
                     #[cfg(fuzzing)]
-                    let balance = Amount::from_u64(1_000_000);
+                    let balance = Amount::max().checked_div_u64(2).unwrap();
 
                     let post_bal = match balance.checked_sub(fees) {
                         Some(post_bal) => {
