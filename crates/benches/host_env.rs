@@ -83,17 +83,19 @@ fn compile_wasm(c: &mut Criterion) {
         group.bench_function(format!("Wasm: {wasm}, size: {len}"), |b| {
             b.iter_batched_ref(
                 || {
-                    let mut shell = BenchShell::default();
+                    let shell = BenchShell::default();
                     // Re-initialize the tx cache to make sure we are not
                     // reading the precompiled modules from there
                     let tempdir = tempfile::tempdir().unwrap();
                     let path = tempdir.path().canonicalize().unwrap();
-                    shell.tx_wasm_cache = TxCache::new(path, 50 * 1024 * 1024);
+                    shell.write().tx_wasm_cache =
+                        TxCache::new(path, 50 * 1024 * 1024);
 
                     (shell, tempdir)
                 },
                 |(shell, _tempdir)| {
                     shell
+                        .write()
                         .tx_wasm_cache
                         .compile_or_fetch(&wasm_code)
                         .unwrap()

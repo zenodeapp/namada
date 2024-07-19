@@ -19,7 +19,6 @@ use masp_primitives::consensus::MainNetwork as Network;
 #[cfg(not(feature = "mainnet"))]
 use masp_primitives::consensus::TestNetwork as Network;
 use masp_primitives::convert::AllowedConversion;
-use masp_primitives::ff::PrimeField;
 use masp_primitives::memo::MemoBytes;
 use masp_primitives::merkle_tree::{
     CommitmentTree, IncrementalWitness, MerklePath,
@@ -2625,7 +2624,7 @@ mod tests {
     }
 }
 
-//#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, feature = "testing"))]
 /// Tests and strategies for transactions
 pub mod testing {
     use std::ops::AddAssign;
@@ -2633,6 +2632,7 @@ pub mod testing {
 
     use masp_primitives::consensus::testing::arb_height;
     use masp_primitives::constants::SPENDING_KEY_GENERATOR;
+    use masp_primitives::ff::PrimeField;
     use masp_primitives::group::GroupEncoding;
     use masp_primitives::sapling::prover::TxProver;
     use masp_primitives::sapling::redjubjub::{PublicKey, Signature};
