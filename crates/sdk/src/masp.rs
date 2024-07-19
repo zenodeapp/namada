@@ -1,7 +1,8 @@
 //! MASP verification wrappers.
 
 mod shielded_sync;
-#[cfg(test)]
+//#[cfg(test)]
+#[cfg(FALSE)]
 mod test_utils;
 
 use std::cmp::Ordering;
@@ -454,6 +455,7 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
 
     /// Update the merkle tree of witnesses the first time we
     /// scan new MASP transactions.
+    #[cfg(FALSE)]
     fn update_witness_map(
         &mut self,
         indexed_tx: IndexedTx,

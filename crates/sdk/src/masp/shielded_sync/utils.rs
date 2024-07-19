@@ -1,7 +1,6 @@
 //! Helper functions and types
 
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -27,14 +26,17 @@ pub type IndexedNoteData = BTreeMap<IndexedTx, Vec<Transaction>>;
 /// Type alias for the entries of [`IndexedNoteData`] iterators
 pub type IndexedNoteEntry = (IndexedTx, Vec<Transaction>);
 
+/// Type alias for a successful note decryption.
 pub type DecryptedData = (Note, PaymentAddress, MemoBytes);
 
+/// Cache of decrypted notes.
 #[derive(Default)]
 pub struct TrialDecrypted {
     inner: HashMap<IndexedTx, HashMap<ViewingKey, Vec<DecryptedData>>>,
 }
 
 impl TrialDecrypted {
+    /// Get cached notes decrypted with `vk`, indexed at `itx`.
     pub fn get(
         &self,
         itx: &IndexedTx,
@@ -43,13 +45,14 @@ impl TrialDecrypted {
         self.inner.get(itx).and_then(|h| h.get(vk))
     }
 
+    /// Cache `notes` decrypted with `vk`, indexed at `itx`.
     pub fn insert(
         &mut self,
         itx: IndexedTx,
         vk: ViewingKey,
-        value: Vec<DecryptedData>,
+        notes: Vec<DecryptedData>,
     ) {
-        self.inner.entry(itx).or_default().insert(vk, value);
+        self.inner.entry(itx).or_default().insert(vk, notes);
     }
 }
 
@@ -140,6 +143,7 @@ pub enum RetryStrategy {
 }
 
 impl RetryStrategy {
+    /// Check if retries are exhausted.
     pub fn may_retry(&mut self) -> bool {
         match self {
             RetryStrategy::Forever => true,
@@ -211,7 +215,7 @@ pub trait MaspClient: Clone {
         &self,
         from: BlockHeight,
         to: BlockHeight,
-    ) -> Result<TxsInBlockRange, Error>;
+    ) -> Result<Vec<IndexedNoteEntry>, Error>;
 
     /// Return the capabilities of this client.
     fn capabilities(&self) -> MaspClientCapabilities;
@@ -275,13 +279,10 @@ impl<C: Client + Send + Sync> MaspClient for LedgerMaspClient<C> {
         &self,
         from: BlockHeight,
         to: BlockHeight,
-    ) -> Result<TxsInBlockRange, Error> {
+    ) -> Result<Vec<IndexedNoteEntry>, Error> {
         // Fetch all the transactions we do not have yet
-        let mut range = TxsInBlockRange {
-            from,
-            to,
-            txs: vec![],
-        };
+        let mut txs = vec![];
+
         for height in from.0..=to.0 {
             // TODO: Fix
             // if tx_sender.contains_height(height) {
@@ -322,7 +323,7 @@ impl<C: Client + Send + Sync> MaspClient for LedgerMaspClient<C> {
                     } else {
                         extract_masp_tx_from_ibc_message(&tx)?
                     };
-                range.txs.push((
+                txs.push((
                     IndexedTx {
                         height: height.into(),
                         index: idx,
@@ -332,7 +333,7 @@ impl<C: Client + Send + Sync> MaspClient for LedgerMaspClient<C> {
             }
         }
 
-        Ok(range)
+        Ok(txs)
     }
 
     #[inline(always)]
@@ -481,7 +482,7 @@ impl MaspClient for IndexerMaspClient {
         &self,
         BlockHeight(mut from): BlockHeight,
         BlockHeight(to): BlockHeight,
-    ) -> Result<TxsInBlockRange, Error> {
+    ) -> Result<Vec<IndexedNoteEntry>, Error> {
         use serde::Deserialize;
 
         #[derive(Deserialize)]
@@ -510,11 +511,7 @@ impl MaspClient for IndexerMaspClient {
         }
 
         const MAX_RANGE_THRES: u64 = 30;
-        let mut range = TxsInBlockRange {
-            from: BlockHeight(from),
-            to: BlockHeight(to),
-            txs: vec![],
-        };
+        let mut txs = vec![];
 
         loop {
             let from_height = from;
@@ -573,7 +570,7 @@ impl MaspClient for IndexerMaspClient {
                     );
                 }
 
-                range.txs.push((
+                txs.push((
                     IndexedTx {
                         height: BlockHeight(block_height),
                         index: TxIndex(block_index),
@@ -587,7 +584,7 @@ impl MaspClient for IndexerMaspClient {
             }
         }
 
-        Ok(range)
+        Ok(txs)
     }
 
     async fn fetch_commitment_tree(
@@ -761,50 +758,6 @@ impl MaspClient for IndexerMaspClient {
     }
 }
 
-pub struct TxsInBlockRange {
-    pub from: BlockHeight,
-    pub to: BlockHeight,
-    pub txs: Vec<IndexedNoteEntry>,
-}
-
-impl Eq for TxsInBlockRange {}
-
-impl PartialEq for TxsInBlockRange {
-    fn eq(&self, other: &Self) -> bool {
-        (self.from, self.to).eq(&(other.from, other.to))
-    }
-}
-
-impl Ord for TxsInBlockRange {
-    fn cmp(&self, other: &Self) -> Ordering {
-        (other.from, other.to).cmp(&(self.from, self.to))
-    }
-}
-
-impl PartialOrd for TxsInBlockRange {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-pub struct FetchedTxs {
-    heap: BinaryHeap<TxsInBlockRange>,
-    curr_block_height: BlockHeight,
-}
-
-impl FetchedTxs {
-    fn next(&mut self) -> Option<TxsInBlockRange> {
-        let maybe_next = self.heap.peek()?;
-
-        if maybe_next.from == self.curr_block_height {
-            self.curr_block_height = maybe_next.to + 1;
-            self.heap.pop()
-        } else {
-            None
-        }
-    }
-}
-
 /// Given a block height range we wish to request and a cache of fetched block
 /// heights, returns the set of ranges we need to request so that all block in
 /// [from, to] get cached.
@@ -915,7 +868,7 @@ impl<'io, IO: Io> DefaultTracker<'io, IO> {
 }
 
 #[derive(Default, Copy, Clone, Debug)]
-pub( in crate::masp) struct IterProgress {
+pub(in crate::masp) struct IterProgress {
     pub index: usize,
     pub length: usize,
 }
@@ -982,4 +935,3 @@ impl<'io, IO: Io> ProgressTracker<IO> for DefaultTracker<'io, IO> {
         locked.length - locked.index
     }
 }
-

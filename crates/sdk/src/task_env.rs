@@ -1,3 +1,5 @@
+//! Functionality to abstract spawning tasks onto a thread pool.
+
 use std::future::Future;
 
 use crate::error::Error;
@@ -24,6 +26,7 @@ pub trait TaskEnvironment {
     ///
     /// An async task spawner is provided, to execute
     /// additional work in the background.
+    #[allow(async_fn_in_trait)]
     async fn run<M, F, R>(self, main: M) -> R
     where
         M: FnOnce(Self::Spawner) -> F,

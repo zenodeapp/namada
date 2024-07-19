@@ -16,7 +16,7 @@ use namada_core::hints;
 use namada_core::storage::BlockHeight;
 use namada_tx::IndexedTx;
 
-use super::utils::{MaspClient, TxsInBlockRange};
+use super::utils::{IndexedNoteEntry, MaspClient};
 use crate::control_flow::ShutdownSignal;
 use crate::error::Error;
 use crate::masp::shielded_sync::trial_decrypt;
@@ -137,6 +137,9 @@ struct TaskError<C> {
     context: C,
 }
 
+// TODO: avoid cloning viewing keys w/ arc-swap+lazy_static or
+// rwlock+lazy_static
+#[allow(clippy::large_enum_variant)]
 enum Message {
     UpdateCommitmentTree(Result<CommitmentTree<Node>, TaskError<BlockHeight>>),
     UpdateNotesMap(Result<BTreeMap<IndexedTx, usize>, TaskError<BlockHeight>>),
@@ -146,7 +149,7 @@ enum Message {
             TaskError<BlockHeight>,
         >,
     ),
-    FetchTxs(Result<TxsInBlockRange, TaskError<[BlockHeight; 2]>>),
+    FetchTxs(Result<Vec<IndexedNoteEntry>, TaskError<[BlockHeight; 2]>>),
     TrialDecrypt(IndexedTx, ViewingKey, Vec<DecryptedData>),
 }
 
@@ -191,6 +194,7 @@ enum DispatcherState {
 }
 
 struct InitialState {
+    #[allow(dead_code)] // TODO: remove dead code attr
     last_witnessed_tx: Option<IndexedTx>,
     start_height: BlockHeight,
     last_query_height: BlockHeight,
@@ -469,10 +473,10 @@ where
                 }
             }
             Message::FetchTxs(Ok(tx_batch)) => {
-                for (itx, txs) in &tx_batch.txs {
+                for (itx, txs) in &tx_batch {
                     self.spawn_trial_decryptions(*itx, txs);
                 }
-                self.cache.fetched.extend(tx_batch.txs);
+                self.cache.fetched.extend(tx_batch);
             }
             Message::FetchTxs(Err(TaskError {
                 error,
@@ -515,13 +519,14 @@ where
             _ => {
                 let client = self.client.clone();
                 self.spawn_async(Box::pin(async move {
-                    Message::UpdateWitnessMap(client
-                        .fetch_witness_map(height)
-                        .await
-                        .map_err(|error| TaskError {
-                            error,
-                            context: height,
-                        }))
+                    Message::UpdateWitnessMap(
+                        client.fetch_witness_map(height).await.map_err(
+                            |error| TaskError {
+                                error,
+                                context: height,
+                            },
+                        ),
+                    )
                 }))
             }
         }
@@ -535,13 +540,14 @@ where
             _ => {
                 let client = self.client.clone();
                 self.spawn_async(Box::pin(async move {
-                    Message::UpdateCommitmentTree(client
-                        .fetch_commitment_tree(height)
-                        .await
-                        .map_err(|error| TaskError {
-                            error,
-                            context: height
-                        }))
+                    Message::UpdateCommitmentTree(
+                        client.fetch_commitment_tree(height).await.map_err(
+                            |error| TaskError {
+                                error,
+                                context: height,
+                            },
+                        ),
+                    )
                 }));
             }
         }
@@ -555,13 +561,14 @@ where
             _ => {
                 let client = self.client.clone();
                 self.spawn_async(Box::pin(async move {
-                    Message::UpdateNotesMap(client
-                        .fetch_tx_notes_map(height)
-                        .await
-                        .map_err(|error| TaskError {
-                            error,
-                            context: height,
-                        }))
+                    Message::UpdateNotesMap(
+                        client.fetch_tx_notes_map(height).await.map_err(
+                            |error| TaskError {
+                                error,
+                                context: height,
+                            },
+                        ),
+                    )
                 }));
             }
         }
@@ -586,26 +593,20 @@ where
     fn spawn_trial_decryptions(&self, itx: IndexedTx, txs: &[Transaction]) {
         for tx in txs {
             for vk in self.ctx.vk_heights.keys() {
+                let vk = *vk;
+
                 if let Some(decrypted_data) =
                     self.cache.trial_decrypted.get(&itx, &vk)
                 {
                     let dd = decrypted_data.clone();
-                    let vk_cloned = vk.clone();
-                    self.spawn_sync(move |_| {
-                        Message::TrialDecrypt(
-                            itx,
-                            vk_cloned,
-                            dd,
-                        )
-                    })
+                    self.spawn_sync(move |_| Message::TrialDecrypt(itx, vk, dd))
                 } else {
                     let tx = tx.clone();
-                    let vk_cloned = vk.clone();
                     self.spawn_sync(move |interrupt| {
                         Message::TrialDecrypt(
                             itx,
-                            vk_cloned.clone(),
-                            trial_decrypt(tx, vk_cloned, interrupt),
+                            vk,
+                            trial_decrypt(tx, vk, interrupt),
                         )
                     })
                 }

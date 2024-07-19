@@ -17,6 +17,8 @@ pub mod utils;
 const DEFAULT_BUF_SIZE: usize = 32;
 const DEFAULT_BATCH_SIZE: usize = 10;
 
+/// A configuration used to tune the concurrency parameters of
+/// the shielded sync and the client used to fetch data.
 #[derive(TypedBuilder)]
 pub struct ShieldedSyncConfig<M> {
     client: M,
@@ -32,6 +34,7 @@ impl<M> ShieldedSyncConfig<M>
 where
     M: MaspClient,
 {
+    /// Retrieve the [`Dispatcher`] used to run shielded sync.
     pub async fn dispatcher<U, S>(
         self,
         spawner: S,
@@ -69,23 +72,22 @@ pub fn trial_decrypt(
 
     // Listen for notes sent to our viewing keys, only if we are syncing
     // (i.e. in a confirmed status)
-    shielded.
-        sapling_bundle()
+    shielded
+        .sapling_bundle()
         .map_or(&vec![], |x| &x.shielded_outputs)
         .iter()
         .filter_map(|so| {
-                if interrupt_flag.get() {
-                    return None;
-                }
-                // Let's try to see if this viewing key can decrypt latest
-                // note
-                try_sapling_note_decryption::<_, Proof>(
-                    &NETWORK,
-                    1.into(),
-                    &PreparedIncomingViewingKey::new(&vk.ivk()),
-                    so,
-                )
-
+            if interrupt_flag.get() {
+                return None;
+            }
+            // Let's try to see if this viewing key can decrypt latest
+            // note
+            try_sapling_note_decryption::<_, Proof>(
+                &NETWORK,
+                1.into(),
+                &PreparedIncomingViewingKey::new(&vk.ivk()),
+                so,
+            )
         })
         .collect()
 }

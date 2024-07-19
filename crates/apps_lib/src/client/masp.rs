@@ -8,12 +8,10 @@ use masp_primitives::zip32::ExtendedSpendingKey;
 use namada_sdk::error::Error;
 use namada_sdk::io::Io;
 use namada_sdk::masp::utils::{
-    IndexerMaspClient, LedgerMaspClient, PeekableIter, ProgressTracker,
-    ProgressType,
+    IndexedNoteEntry, IndexerMaspClient, LedgerMaspClient, PeekableIter,
+    ProgressTracker, ProgressType,
 };
-use namada_sdk::masp::{
-    IndexedNoteEntry, ShieldedContext, ShieldedSyncConfig, ShieldedUtils,
-};
+use namada_sdk::masp::{ShieldedContext, ShieldedSyncConfig, ShieldedUtils};
 use namada_sdk::queries::Client;
 use namada_sdk::storage::BlockHeight;
 use namada_sdk::task_env::LocalSetTaskEnvironment;

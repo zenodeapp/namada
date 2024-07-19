@@ -14,7 +14,10 @@ use tendermint_rpc::SimpleRequest;
 
 use crate::error::Error;
 use crate::io::Io;
-use crate::masp::utils::{IndexedNoteEntry, IterProgress, MaspClient, MaspClientCapabilities, PeekableIter, ProgressTracker, TxsInBlockRange};
+use crate::masp::utils::{
+    IndexedNoteEntry, IterProgress, MaspClient, MaspClientCapabilities,
+    PeekableIter, ProgressTracker,
+};
 use crate::queries::testing::TestClient;
 use crate::queries::{Client, EncodedResponseQuery, Rpc, RPC};
 
@@ -227,12 +230,9 @@ impl MaspClient for TestingMaspClient<'_> {
         &self,
         from: BlockHeight,
         to: BlockHeight,
-    ) -> Result<TxsInBlockRange, Error> {
-        let mut range = TxsInBlockRange {
-            from,
-            to,
-            txs: vec![],
-        };
+    ) -> Result<Vec<IndexedNoteEntry>, Error> {
+        let mut txs = vec![];
+
         for _height in from.0..=to.0 {
             let next_tx = self
                 .client
@@ -244,9 +244,10 @@ impl MaspClient for TestingMaspClient<'_> {
                         "Connection to fetch MASP txs failed".to_string(),
                     )
                 })?;
-            range.txs.push(next_tx);
+            txs.push(next_tx);
         }
-        Ok(range)
+
+        Ok(txs)
     }
 
     #[inline(always)]
