@@ -19,6 +19,7 @@ use masp_primitives::consensus::MainNetwork as Network;
 #[cfg(not(feature = "mainnet"))]
 use masp_primitives::consensus::TestNetwork as Network;
 use masp_primitives::convert::AllowedConversion;
+use masp_primitives::ff::PrimeField;
 use masp_primitives::memo::MemoBytes;
 use masp_primitives::merkle_tree::{
     CommitmentTree, IncrementalWitness, MerklePath,
@@ -44,8 +45,8 @@ use namada_core::arith::CheckedAdd;
 use namada_core::collections::{HashMap, HashSet};
 use namada_core::dec::Dec;
 pub use namada_core::masp::{
-    encode_asset_type, AssetData, BalanceOwner, ExtendedViewingKey,
-    PaymentAddress, TAddrData, TransferSource, TransferTarget, TxId,
+    encode_asset_type, AssetData, BalanceOwner, ExtendedViewingKey, TAddrData,
+    TransferSource, TransferTarget, TxId,
 };
 use namada_core::masp::{MaspEpoch, MaspTxRefs};
 use namada_core::storage::{BlockHeight, TxIndex};
@@ -454,7 +455,6 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
 
     /// Update the merkle tree of witnesses the first time we
     /// scan new MASP transactions.
-    #[cfg(FALSE)]
     fn update_witness_map(
         &mut self,
         indexed_tx: IndexedTx,
@@ -786,6 +786,51 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
         res
     }
 
+    #[allow(missing_docs)]
+    pub fn save_decrypted_shielded_outputs(
+        &mut self,
+        vk: &ViewingKey,
+        note_pos: usize,
+        note: Note,
+        pa: masp_primitives::sapling::PaymentAddress,
+        memo: MemoBytes,
+    ) -> Result<(), Error> {
+        // Add this note to list of notes decrypted by this
+        // viewing key
+        self.pos_map.entry(*vk).or_default().insert(note_pos);
+        // Compute the nullifier now to quickly recognize when
+        // spent
+        let nf = note.nf(
+            &vk.nk,
+            note_pos.try_into().map_err(|_| {
+                Error::Other("Can not get nullifier".to_string())
+            })?,
+        );
+        self.note_map.insert(note_pos, note);
+        self.memo_map.insert(note_pos, memo);
+        // The payment address' diversifier is required to spend
+        // note
+        self.div_map.insert(note_pos, *pa.diversifier());
+        self.nf_map.insert(nf, note_pos);
+        self.vk_map.insert(note_pos, *vk);
+        Ok(())
+    }
+
+    #[allow(missing_docs)]
+    pub fn save_shielded_spends(&mut self, transactions: &[Transaction]) {
+        for stx in transactions {
+            for ss in
+                stx.sapling_bundle().map_or(&vec![], |x| &x.shielded_spends)
+            {
+                // If the shielded spend's nullifier is in our map, then target
+                // note is rendered unusable
+                if let Some(note_pos) = self.nf_map.get(&ss.nullifier) {
+                    self.spents.insert(*note_pos);
+                }
+            }
+        }
+    }
+
     /// Applies the given transaction to the supplied context. More precisely,
     /// the shielded transaction's outputs are added to the commitment tree.
     /// Newly discovered notes are associated to the supplied viewing keys. Note
@@ -808,7 +853,6 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
         >;
 
         // For tracking the account changes caused by this Transaction
-        let mut transaction_delta = TransactionDelta::new();
         if let ContextSyncStatus::Confirmed = self.sync_status {
             let mut note_pos = self.tx_note_map[&indexed_tx];
             // Listen for notes sent to our viewing keys, only if we are syncing
@@ -819,7 +863,6 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
                 {
                     // Let's try to see if this viewing key can decrypt latest
                     // note
-                    let notes = self.pos_map.entry(*vk).or_default();
                     let decres = try_sapling_note_decryption::<_, Proof>(
                         &NETWORK,
                         1.into(),
@@ -829,40 +872,9 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
                     // So this current viewing key does decrypt this current
                     // note...
                     if let Some((note, pa, memo)) = decres {
-                        // Add this note to list of notes decrypted by this
-                        // viewing key
-                        notes.insert(note_pos);
-                        // Compute the nullifier now to quickly recognize when
-                        // spent
-                        let nf = note.nf(
-                            &vk.nk,
-                            note_pos.try_into().map_err(|_| {
-                                Error::Other(
-                                    "Can not get nullifier".to_string(),
-                                )
-                            })?,
-                        );
-                        self.note_map.insert(note_pos, note);
-                        self.memo_map.insert(note_pos, memo);
-                        // The payment address' diversifier is required to spend
-                        // note
-                        self.div_map.insert(note_pos, *pa.diversifier());
-                        self.nf_map.insert(nf, note_pos);
-                        // Note the account changes
-                        let balance = transaction_delta
-                            .entry(*vk)
-                            .or_insert_with(I128Sum::zero);
-                        *balance += I128Sum::from_nonnegative(
-                            note.asset_type,
-                            note.value as i128,
-                        )
-                        .map_err(|()| {
-                            Error::Other(
-                                "found note with invalid value or asset type"
-                                    .to_string(),
-                            )
-                        })?;
-                        self.vk_map.insert(note_pos, *vk);
+                        self.save_decrypted_shielded_outputs(
+                            vk, note_pos, note, pa, memo,
+                        )?;
                     }
                     note_pos += 1;
                 }
@@ -870,33 +882,7 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
         }
 
         // Cancel out those of our notes that have been spent
-        for tx in shielded {
-            for ss in
-                tx.sapling_bundle().map_or(&vec![], |x| &x.shielded_spends)
-            {
-                // If the shielded spend's nullifier is in our map, then target
-                // note is rendered unusable
-                if let Some(note_pos) = self.nf_map.get(&ss.nullifier) {
-                    self.spents.insert(*note_pos);
-                    // Note the account changes
-                    let balance = transaction_delta
-                        .entry(self.vk_map[note_pos])
-                        .or_insert_with(I128Sum::zero);
-                    let note = self.note_map[note_pos];
-
-                    *balance -= I128Sum::from_nonnegative(
-                        note.asset_type,
-                        note.value as i128,
-                    )
-                    .map_err(|()| {
-                        Error::Other(
-                            "found note with invalid value or asset type"
-                                .to_string(),
-                        )
-                    })?;
-                }
-            }
-        }
+        self.save_shielded_spends(shielded);
 
         Ok(())
     }
@@ -2632,7 +2618,6 @@ pub mod testing {
 
     use masp_primitives::consensus::testing::arb_height;
     use masp_primitives::constants::SPENDING_KEY_GENERATOR;
-    use masp_primitives::ff::PrimeField;
     use masp_primitives::group::GroupEncoding;
     use masp_primitives::sapling::prover::TxProver;
     use masp_primitives::sapling::redjubjub::{PublicKey, Signature};

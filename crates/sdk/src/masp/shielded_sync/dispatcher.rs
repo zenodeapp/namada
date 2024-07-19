@@ -297,7 +297,7 @@ where
         sks: &[ExtendedSpendingKey],
         fvks: &[ViewingKey],
     ) -> Result<(), Error> {
-        let _initial_state = self
+        let initial_state = self
             .perform_initial_setup(
                 start_query_height,
                 last_query_height,
@@ -311,18 +311,19 @@ where
             self.handle_incoming_message(message);
         }
 
-        // TODO: save cache to file
-
         match self.state {
-            DispatcherState::Errored(err) => Err(err),
-            DispatcherState::Interrupted => Ok(()),
+            DispatcherState::Errored(err) => {
+                // TODO: save cache to file
+                Err(err)
+            }
+            DispatcherState::Interrupted => {
+                // TODO: save cache to file
+                Ok(())
+            }
             DispatcherState::Normal => {
                 // TODO: load shielded context at this stage
 
-                // TODO: go through sync phase of the algorithm,
-                // gathering+processing all data collected in cache
-                // onto the loaded shielded context
-
+                self.apply_cache_to_shielded_context(&initial_state)?;
                 self.ctx.save().await.map_err(|err| {
                     Error::Other(format!(
                         "Failed to save the shielded context: {err}"
@@ -332,6 +333,58 @@ where
                 Ok(())
             }
         }
+    }
+
+    fn apply_cache_to_shielded_context(
+        &mut self,
+        InitialState {
+            last_witnessed_tx, ..
+        }: &InitialState,
+    ) -> Result<(), Error> {
+        if let Some((_, cmt)) = self.cache.commitment_tree.take() {
+            self.ctx.tree = cmt;
+        }
+        if let Some((_, wm)) = self.cache.witness_map.take() {
+            self.ctx.witness_map = wm;
+        }
+        if let Some((_, nm)) = self.cache.tx_note_map.take() {
+            self.ctx.tx_note_map = nm;
+        }
+
+        for (indexed_tx, stx_batch) in self.cache.fetched.take() {
+            if self.client.capabilities().needs_witness_map_update()
+                && Some(&indexed_tx) > last_witnessed_tx.as_ref()
+            {
+                self.ctx.update_witness_map(indexed_tx, &stx_batch)?;
+            }
+            let mut note_pos = self.ctx.tx_note_map[&indexed_tx];
+            let mut vk_heights = BTreeMap::new();
+            std::mem::swap(&mut vk_heights, &mut self.ctx.vk_heights);
+            for (vk, h) in vk_heights
+                .iter_mut()
+                .filter(|(_vk, h)| h.as_ref() < Some(&indexed_tx))
+            {
+                // TODO: test that we drain the entire cache of
+                // decrypted notes (i.e.
+                // `self.cache.trial_decrypted.is_empty()`)
+                for (note, pa, memo) in self
+                    .cache
+                    .trial_decrypted
+                    .take(&indexed_tx, vk)
+                    .unwrap_or_default()
+                {
+                    self.ctx.save_decrypted_shielded_outputs(
+                        vk, note_pos, note, pa, memo,
+                    )?;
+                    self.ctx.save_shielded_spends(&stx_batch);
+                    note_pos += 1;
+                }
+                *h = Some(indexed_tx);
+            }
+            std::mem::swap(&mut vk_heights, &mut self.ctx.vk_heights);
+        }
+
+        Ok(())
     }
 
     async fn perform_initial_setup(

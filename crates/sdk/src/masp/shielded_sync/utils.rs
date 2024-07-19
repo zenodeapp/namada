@@ -45,6 +45,23 @@ impl TrialDecrypted {
         self.inner.get(itx).and_then(|h| h.get(vk))
     }
 
+    /// Take cached notes decrypted with `vk`, indexed at `itx`.
+    pub fn take(
+        &mut self,
+        itx: &IndexedTx,
+        vk: &ViewingKey,
+    ) -> Option<Vec<DecryptedData>> {
+        let (notes, no_more_notes) = {
+            let viewing_keys_to_notes = self.inner.get_mut(itx)?;
+            let notes = viewing_keys_to_notes.swap_remove(vk)?;
+            (notes, viewing_keys_to_notes.is_empty())
+        };
+        if no_more_notes {
+            self.inner.swap_remove(itx);
+        }
+        Some(notes)
+    }
+
     /// Cache `notes` decrypted with `vk`, indexed at `itx`.
     pub fn insert(
         &mut self,
@@ -73,6 +90,12 @@ impl Fetched {
         I: IntoIterator<Item = IndexedNoteEntry>,
     {
         self.txs.extend(items);
+    }
+
+    /// Iterates over the fetched transactions in the order
+    /// they appear in blocks.
+    pub fn take(&mut self) -> impl IntoIterator<Item = IndexedNoteEntry> {
+        std::mem::take(&mut self.txs)
     }
 
     /// Add a single entry to the cache.
