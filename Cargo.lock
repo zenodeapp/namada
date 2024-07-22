@@ -5160,6 +5160,8 @@ version = "0.40.0"
 dependencies = [
  "borsh",
  "namada_core",
+ "namada_state",
+ "prost 0.12.3",
  "strum 0.24.1",
 ]
 
