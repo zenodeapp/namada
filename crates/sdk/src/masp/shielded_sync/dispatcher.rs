@@ -635,6 +635,10 @@ where
     }
 
     fn spawn_fetch_txs(&self, from: BlockHeight, to: BlockHeight) {
+        // FIXME: we need to send the txs we have in cache over the channel!
+        // currently, we're only sending txs we don't have in cache over the
+        // chan, which means we are skipping scanning txs in cache
+
         for [from, to] in blocks_left_to_fetch(from, to, &self.cache.fetched) {
             let client = self.client.clone();
             self.spawn_async(Box::pin(async move {
