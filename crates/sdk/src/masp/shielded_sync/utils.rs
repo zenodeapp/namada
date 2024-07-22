@@ -782,9 +782,9 @@ impl MaspClient for IndexerMaspClient {
 }
 
 /// Given a block height range we wish to request and a cache of fetched block
-/// heights, returns the set of ranges we need to request so that all block in
-/// [from, to] get cached.
-pub fn range_gaps(
+/// heights, returns the set of sub-ranges we need to request so that all blocks
+/// in the inclusive range `[from, to]` get cached.
+pub fn blocks_left_to_fetch(
     from: BlockHeight,
     to: BlockHeight,
     fetched: &Fetched,

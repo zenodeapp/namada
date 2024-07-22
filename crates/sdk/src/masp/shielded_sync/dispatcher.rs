@@ -21,7 +21,7 @@ use crate::control_flow::ShutdownSignal;
 use crate::error::Error;
 use crate::masp::shielded_sync::trial_decrypt;
 use crate::masp::utils::{
-    range_gaps, DecryptedData, Fetched, RetryStrategy, TrialDecrypted,
+    blocks_left_to_fetch, DecryptedData, Fetched, RetryStrategy, TrialDecrypted,
 };
 use crate::masp::{
     to_viewing_key, ShieldedContext, ShieldedUtils, TxNoteMap, WitnessMap,
@@ -635,7 +635,7 @@ where
     }
 
     fn spawn_fetch_txs(&self, from: BlockHeight, to: BlockHeight) {
-        for [from, to] in range_gaps(from, to, &self.cache.fetched) {
+        for [from, to] in blocks_left_to_fetch(from, to, &self.cache.fetched) {
             let client = self.client.clone();
             self.spawn_async(Box::pin(async move {
                 Message::FetchTxs(
