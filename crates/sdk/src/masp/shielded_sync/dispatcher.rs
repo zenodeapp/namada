@@ -37,6 +37,17 @@ impl AsyncCounterInner {
     fn increment(&self) {
         self.count.fetch_add(1, atomic::Ordering::Relaxed);
     }
+
+    fn decrement_then_exit(&self) -> bool {
+        // NB: if the prev value is 1, the new value
+        // is eq to 0, which means we must wake the
+        // waiting future
+        self.count.fetch_sub(1, atomic::Ordering::Relaxed) == 1
+    }
+
+    fn value(&self) -> usize {
+        self.count.load(atomic::Ordering::Relaxed)
+    }
 }
 
 struct AsyncCounter {
@@ -52,10 +63,6 @@ impl AsyncCounter {
             }),
         }
     }
-
-    fn value(&self) -> usize {
-        self.inner.count.load(atomic::Ordering::Relaxed)
-    }
 }
 
 impl Clone for AsyncCounter {
@@ -68,7 +75,7 @@ impl Clone for AsyncCounter {
 
 impl Drop for AsyncCounter {
     fn drop(&mut self) {
-        if self.inner.count.fetch_sub(1, atomic::Ordering::Relaxed) == 1 {
+        if self.inner.decrement_then_exit() {
             self.inner.waker.wake();
         }
     }
@@ -78,7 +85,7 @@ impl Future for AsyncCounter {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.value() == 0 {
+        if self.inner.value() == 0 {
             Poll::Ready(())
         } else {
             self.inner.waker.register(cx.waker());
