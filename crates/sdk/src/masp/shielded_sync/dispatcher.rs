@@ -21,7 +21,8 @@ use crate::control_flow::ShutdownSignal;
 use crate::error::Error;
 use crate::masp::shielded_sync::trial_decrypt;
 use crate::masp::utils::{
-    blocks_left_to_fetch, DecryptedData, Fetched, RetryStrategy, TrialDecrypted,
+    blocks_left_to_fetch, DecryptedData, FetchRequestRange, FetchSource,
+    Fetched, RetryStrategy, TrialDecrypted,
 };
 use crate::masp::{
     to_viewing_key, ShieldedContext, ShieldedUtils, TxNoteMap, WitnessMap,
@@ -635,22 +636,34 @@ where
     }
 
     fn spawn_fetch_txs(&self, from: BlockHeight, to: BlockHeight) {
-        // FIXME: we need to send the txs we have in cache over the channel!
-        // currently, we're only sending txs we don't have in cache over the
-        // chan, which means we are skipping scanning txs in cache
-
-        for [from, to] in blocks_left_to_fetch(from, to, &self.cache.fetched) {
-            let client = self.client.clone();
-            self.spawn_async(Box::pin(async move {
-                Message::FetchTxs(
-                    client.fetch_shielded_transfers(from, to).await.map_err(
-                        |error| TaskError {
-                            error,
-                            context: [from, to],
-                        },
-                    ),
-                )
-            }));
+        for FetchRequestRange { from, to, source } in
+            blocks_left_to_fetch(from, to, &self.cache.fetched)
+        {
+            match source {
+                FetchSource::Remote => {
+                    let client = self.client.clone();
+                    self.spawn_async(Box::pin(async move {
+                        Message::FetchTxs(
+                            client
+                                .fetch_shielded_transfers(from, to)
+                                .await
+                                .map_err(|error| TaskError {
+                                    error,
+                                    context: [from, to],
+                                }),
+                        )
+                    }));
+                }
+                FetchSource::Cache => {
+                    let tx_batch = self
+                        .cache
+                        .fetched
+                        .txs_in_range(from, to)
+                        .map(|(indexed_tx, txs)| (*indexed_tx, txs.clone()))
+                        .collect();
+                    self.spawn_sync(move |_| Message::FetchTxs(Ok(tx_batch)));
+                }
+            }
         }
     }
 

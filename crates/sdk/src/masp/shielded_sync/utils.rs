@@ -10,7 +10,7 @@ use masp_primitives::sapling::{Node, Note, PaymentAddress, ViewingKey};
 use masp_primitives::transaction::Transaction;
 use namada_core::collections::HashMap;
 use namada_core::storage::{BlockHeight, TxIndex};
-use namada_tx::{IndexedTx, Tx};
+use namada_tx::{IndexedTx, IndexedTxRange, Tx};
 
 use crate::error::{Error, QueryError};
 use crate::io::Io;
@@ -25,6 +25,9 @@ pub type IndexedNoteData = BTreeMap<IndexedTx, Vec<Transaction>>;
 
 /// Type alias for the entries of [`IndexedNoteData`] iterators
 pub type IndexedNoteEntry = (IndexedTx, Vec<Transaction>);
+
+/// Borrowed version of an [`IndexedNoteEntry`]
+pub type IndexedNoteEntryRefs<'a> = (&'a IndexedTx, &'a Vec<Transaction>);
 
 /// Type alias for a successful note decryption.
 pub type DecryptedData = (Note, PaymentAddress, MemoBytes);
@@ -105,8 +108,21 @@ impl Fetched {
 
     /// Check if this cache has already been populated for a given
     /// block height.
-    pub fn contains_height(&self, height: u64) -> bool {
-        self.txs.keys().any(|k| k.height.0 == height)
+    pub fn contains_height(&self, height: BlockHeight) -> bool {
+        self.txs
+            .range(IndexedTxRange::with_height(height))
+            .next()
+            .is_some()
+    }
+
+    /// Check if this cache has already been populated for a given
+    /// block height.
+    pub fn txs_in_range(
+        &self,
+        from: BlockHeight,
+        to: BlockHeight,
+    ) -> impl Iterator<Item = IndexedNoteEntryRefs<'_>> + '_ {
+        self.txs.range(IndexedTxRange::between_heights(from, to))
     }
 
     /// We remove all indices from blocks that have been entirely scanned.
@@ -781,6 +797,24 @@ impl MaspClient for IndexerMaspClient {
     }
 }
 
+/// Where to fetch a range of masp txs from.
+pub enum FetchSource {
+    /// Get txs from cache.
+    Cache,
+    /// Get txs from a remote provider.
+    Remote,
+}
+
+/// Represents a fetch request in a certain (inclusive) block range.
+pub struct FetchRequestRange {
+    /// Where to fetch a range of masp txs from.
+    pub source: FetchSource,
+    /// The lower bound of the block range.
+    pub from: BlockHeight,
+    /// The upper bound of the block range.
+    pub to: BlockHeight,
+}
+
 /// Given a block height range we wish to request and a cache of fetched block
 /// heights, returns the set of sub-ranges we need to request so that all blocks
 /// in the inclusive range `[from, to]` get cached.
@@ -788,28 +822,65 @@ pub fn blocks_left_to_fetch(
     from: BlockHeight,
     to: BlockHeight,
     fetched: &Fetched,
-) -> Vec<[BlockHeight; 2]> {
-    let mut to_fetch = Vec::with_capacity((to.0 - from.0 + 1) as usize);
-    let mut current_from = from;
+) -> Vec<FetchRequestRange> {
+    if from.0 == 0 || to.0 == 0 {
+        panic!("There is no height 0");
+    }
+
+    let mut requested_ranges = Vec::with_capacity((to.0 - from.0 + 1) as usize);
+
+    let mut fetch_current_from = from;
+    let mut cache_current_from = from;
+
     let mut need_to_fetch = true;
 
     for height in from.0..=to.0 {
-        // cross an upper gap boundary
-        if need_to_fetch && fetched.contains_height(height) {
-            if height > current_from.0 {
-                to_fetch.push([current_from, BlockHeight(height - 1)]);
+        let height_in_cache = fetched.contains_height(BlockHeight(height));
+
+        match (need_to_fetch, height_in_cache) {
+            (true, true) => {
+                // cross an upper gap boundary
+                if height > fetch_current_from.0 {
+                    requested_ranges.push(FetchRequestRange {
+                        from: fetch_current_from,
+                        to: BlockHeight(height - 1),
+                        source: FetchSource::Remote,
+                    });
+                }
+                cache_current_from = BlockHeight(height);
+                need_to_fetch = false;
             }
-            need_to_fetch = false;
-        } else if !need_to_fetch && !fetched.contains_height(height) {
-            // cross a lower gap boundary
-            current_from = height.into();
-            need_to_fetch = true;
+            (false, false) => {
+                // cross a lower gap boundary
+                if height > cache_current_from.0 {
+                    requested_ranges.push(FetchRequestRange {
+                        from: cache_current_from,
+                        to: BlockHeight(height - 1),
+                        source: FetchSource::Cache,
+                    });
+                }
+                fetch_current_from = BlockHeight(height);
+                need_to_fetch = true;
+            }
+            _ => {} // NOOP
         }
     }
+
     if need_to_fetch {
-        to_fetch.push([current_from, to]);
+        requested_ranges.push(FetchRequestRange {
+            from: fetch_current_from,
+            to,
+            source: FetchSource::Remote,
+        });
+    } else {
+        requested_ranges.push(FetchRequestRange {
+            from: fetch_current_from,
+            to,
+            source: FetchSource::Cache,
+        });
     }
-    to_fetch
+
+    requested_ranges
 }
 
 /// An enum to indicate how to track progress depending on
