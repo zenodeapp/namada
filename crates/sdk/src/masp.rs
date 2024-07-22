@@ -510,7 +510,7 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
         env.run(|spawner| async move {
             let dispatcher = config.dispatcher(spawner, &self.utils).await;
 
-            dispatcher
+            if let Some(updated_ctx) = dispatcher
                 .run(
                     shutdown_signal,
                     start_query_height,
@@ -518,14 +518,12 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
                     sks,
                     fvks,
                 )
-                .await?;
+                .await?
+            {
+                *self = updated_ctx;
+            }
 
-            self.load().await.map_err(|err| {
-                Error::Other(format!(
-                    "Failed to reload the updated shielded context from disk: \
-                     {err}"
-                ))
-            })
+            Ok(())
         })
         .await
 

@@ -296,7 +296,7 @@ where
         last_query_height: Option<BlockHeight>,
         sks: &[ExtendedSpendingKey],
         fvks: &[ViewingKey],
-    ) -> Result<(), Error> {
+    ) -> Result<Option<ShieldedContext<U>>, Error> {
         let initial_state = self
             .perform_initial_setup(
                 start_query_height,
@@ -318,7 +318,7 @@ where
             }
             DispatcherState::Interrupted => {
                 // TODO: save cache to file
-                Ok(())
+                Ok(None)
             }
             DispatcherState::Normal => {
                 // TODO: load shielded context at this stage
@@ -330,7 +330,7 @@ where
                     ))
                 })?;
 
-                Ok(())
+                Ok(Some(self.ctx))
             }
         }
     }
