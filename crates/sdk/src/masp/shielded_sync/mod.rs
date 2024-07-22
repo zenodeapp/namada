@@ -70,16 +70,14 @@ pub fn trial_decrypt(
         >::Proof
     >;
 
-    // Listen for notes sent to our viewing keys, only if we are syncing
-    // (i.e. in a confirmed status)
+    let not_interrupted = || !interrupt_flag.get();
+
     shielded
         .sapling_bundle()
         .map_or(&vec![], |x| &x.shielded_outputs)
         .iter()
+        .take_while(|_| not_interrupted())
         .filter_map(|so| {
-            if interrupt_flag.get() {
-                return None;
-            }
             // Let's try to see if this viewing key can decrypt latest
             // note
             try_sapling_note_decryption::<_, Proof>(
