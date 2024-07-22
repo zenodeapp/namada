@@ -38,7 +38,7 @@ impl AsyncCounterInner {
         self.count.fetch_add(1, atomic::Ordering::Relaxed);
     }
 
-    fn decrement_then_exit(&self) -> bool {
+    fn decrement_then_wake(&self) -> bool {
         // NB: if the prev value is 1, the new value
         // is eq to 0, which means we must wake the
         // waiting future
@@ -75,7 +75,7 @@ impl Clone for AsyncCounter {
 
 impl Drop for AsyncCounter {
     fn drop(&mut self) {
-        if self.inner.decrement_then_exit() {
+        if self.inner.decrement_then_wake() {
             self.inner.waker.wake();
         }
     }
