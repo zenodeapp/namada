@@ -1807,7 +1807,7 @@ impl IndexedTxRange {
 
     /// The end of the range.
     pub const fn end(&self) -> IndexedTx {
-        self.lo
+        self.hi
     }
 }
 
