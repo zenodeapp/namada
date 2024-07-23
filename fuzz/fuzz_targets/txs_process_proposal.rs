@@ -17,7 +17,7 @@ fuzz_target!(|txs: Vec<Tx>| {
     let mut txs_bytes: Vec<Vec<u8>> = Vec::with_capacity(txs.len());
     for tx in txs {
         if let Ok(tx_bytes) = tx.try_to_bytes() {
-            txs_bytes.push(tx_bytes.into());
+            txs_bytes.push(tx_bytes);
         } else {
             return;
         }
