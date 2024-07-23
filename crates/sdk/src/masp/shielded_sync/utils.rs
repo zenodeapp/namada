@@ -997,3 +997,234 @@ impl<'io, IO: Io> ProgressTracker<IO> for DefaultTracker<'io, IO> {
         locked.length - locked.index
     }
 }
+
+#[cfg(test)]
+mod test_blocks_left_to_fetch {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    struct ArbRange {
+        max_from: u64,
+        max_len: u64,
+    }
+
+    impl Default for ArbRange {
+        fn default() -> Self {
+            Self {
+                max_from: u64::MAX,
+                max_len: 1000,
+            }
+        }
+    }
+
+    fn fetched_cache_with_blocks(
+        blocks_in_cache: impl IntoIterator<Item = BlockHeight>,
+    ) -> Fetched {
+        let txs = blocks_in_cache
+            .into_iter()
+            .map(|height| {
+                (
+                    IndexedTx {
+                        height,
+                        index: TxIndex(0),
+                    },
+                    vec![],
+                )
+            })
+            .collect();
+        Fetched { txs }
+    }
+
+    fn blocks_in_range(
+        from: BlockHeight,
+        to: BlockHeight,
+    ) -> impl Iterator<Item = BlockHeight> {
+        (from.0..=to.0).map(BlockHeight)
+    }
+
+    prop_compose! {
+        fn arb_block_range(ArbRange { max_from, max_len }: ArbRange)
+        (
+            from in 1u64..=max_from,
+        )
+        (
+            from in Just(from),
+            to in from..from.saturating_add(max_len)
+        )
+        -> (BlockHeight, BlockHeight)
+        {
+            (BlockHeight(from), BlockHeight(to))
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn test_empty_cache_with_singleton_output((from, to) in arb_block_range(ArbRange::default())) {
+            let empty_cache = fetched_cache_with_blocks([]);
+
+            let &[[returned_from, returned_to]] = blocks_left_to_fetch(
+                from,
+                to,
+                &empty_cache,
+            )
+            .as_slice() else {
+                return Err(TestCaseError::Fail("Test failed".into()));
+            };
+
+            prop_assert_eq!(returned_from, from);
+            prop_assert_eq!(returned_to, to);
+        }
+
+        #[test]
+        fn test_non_empty_cache_with_empty_output((from, to) in arb_block_range(ArbRange::default())) {
+            let cache = fetched_cache_with_blocks(
+                blocks_in_range(from, to)
+            );
+
+            let &[] = blocks_left_to_fetch(
+                from,
+                to,
+                &cache,
+            )
+            .as_slice() else {
+                return Err(TestCaseError::Fail("Test failed".into()));
+            };
+        }
+
+        #[test]
+        fn test_non_empty_cache_with_singleton_input_and_maybe_singleton_output(
+            (from, to) in arb_block_range(ArbRange::default()),
+            block_height in 1u64..1000,
+        ) {
+            test_non_empty_cache_with_singleton_input_and_maybe_singleton_output_inner(
+                from,
+                to,
+                BlockHeight(block_height),
+            )?;
+        }
+
+        #[test]
+        fn test_non_empty_cache_with_singleton_hole_and_singleton_output(
+            (first_from, first_to) in
+                arb_block_range(ArbRange {
+                    max_from: 1_000_000,
+                    max_len: 1000,
+                }),
+        ) {
+            // [from, to], [to + 2, 2 * to - from + 2]
+
+            let hole = first_to + 1;
+            let second_from = BlockHeight(first_to.0 + 2);
+            let second_to = BlockHeight(2 * first_to.0 - first_from.0 + 2);
+
+            let cache = fetched_cache_with_blocks(
+                blocks_in_range(first_from, first_to)
+                    .chain(blocks_in_range(second_from, second_to)),
+            );
+
+            let &[[returned_from, returned_to]] = blocks_left_to_fetch(
+                first_from,
+                second_to,
+                &cache,
+            )
+            .as_slice() else {
+                return Err(TestCaseError::Fail("Test failed".into()));
+            };
+
+            prop_assert_eq!(returned_from, hole);
+            prop_assert_eq!(returned_to, hole);
+        }
+    }
+
+    fn test_non_empty_cache_with_singleton_input_and_maybe_singleton_output_inner(
+        from: BlockHeight,
+        to: BlockHeight,
+        block_height: BlockHeight,
+    ) -> Result<(), TestCaseError> {
+        let cache = fetched_cache_with_blocks(blocks_in_range(from, to));
+
+        if block_height >= from && block_height <= to {
+            // random height is inside the range of txs in cache
+
+            let &[] = blocks_left_to_fetch(block_height, block_height, &cache)
+                .as_slice()
+            else {
+                return Err(TestCaseError::Fail("Test failed".into()));
+            };
+        } else {
+            // random height is outside the range of txs in cache
+
+            let &[[returned_from, returned_to]] =
+                blocks_left_to_fetch(block_height, block_height, &cache)
+                    .as_slice()
+            else {
+                return Err(TestCaseError::Fail("Test failed".into()));
+            };
+
+            prop_assert_eq!(returned_from, block_height);
+            prop_assert_eq!(returned_to, block_height);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_happy_flow() {
+        let cache = fetched_cache_with_blocks([
+            BlockHeight(1),
+            BlockHeight(5),
+            BlockHeight(6),
+            BlockHeight(8),
+            BlockHeight(11),
+        ]);
+
+        let from = BlockHeight(1);
+        let to = BlockHeight(10);
+
+        let blocks_to_fetch = blocks_left_to_fetch(from, to, &cache);
+        assert_eq!(
+            &blocks_to_fetch,
+            &[
+                [BlockHeight(2), BlockHeight(4)],
+                [BlockHeight(7), BlockHeight(7)],
+                [BlockHeight(9), BlockHeight(10)],
+            ],
+        );
+    }
+
+    #[test]
+    fn test_endpoint_cases() {
+        let cache =
+            fetched_cache_with_blocks(blocks_in_range(2.into(), 4.into()));
+        let blocks_to_fetch = blocks_left_to_fetch(1.into(), 3.into(), &cache);
+        assert_eq!(&blocks_to_fetch, &[[BlockHeight(1), BlockHeight(1)]]);
+
+        // -------------
+
+        let cache =
+            fetched_cache_with_blocks(blocks_in_range(1.into(), 3.into()));
+        let blocks_to_fetch = blocks_left_to_fetch(2.into(), 4.into(), &cache);
+        assert_eq!(&blocks_to_fetch, &[[BlockHeight(4), BlockHeight(4)]]);
+
+        // -------------
+
+        let cache =
+            fetched_cache_with_blocks(blocks_in_range(2.into(), 4.into()));
+        let blocks_to_fetch = blocks_left_to_fetch(1.into(), 5.into(), &cache);
+        assert_eq!(
+            &blocks_to_fetch,
+            &[
+                [BlockHeight(1), BlockHeight(1)],
+                [BlockHeight(5), BlockHeight(5)],
+            ],
+        );
+
+        // -------------
+
+        let cache =
+            fetched_cache_with_blocks(blocks_in_range(1.into(), 5.into()));
+        let blocks_to_fetch = blocks_left_to_fetch(2.into(), 4.into(), &cache);
+        assert!(blocks_to_fetch.is_empty());
+    }
+}
