@@ -1029,7 +1029,6 @@ where
         }
 
         // Tx signature check
-        #[cfg(not(fuzzing))]
         let tx_type = match tx.validate_tx() {
             Ok(_) => tx.header(),
             Err(msg) => {
@@ -1038,8 +1037,6 @@ where
                 return response;
             }
         };
-        #[cfg(fuzzing)]
-        let tx_type = tx.header();
 
         // try to parse a vote extension protocol tx from
         // the provided tx data
