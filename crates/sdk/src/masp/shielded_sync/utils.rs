@@ -97,6 +97,15 @@ impl Fetched {
 
     /// Iterates over the fetched transactions in the order
     /// they appear in blocks.
+    pub fn iter(
+        &self,
+    ) -> impl IntoIterator<Item = IndexedNoteEntryRefs<'_>> + '_ {
+        &self.txs
+    }
+
+    /// Iterates over the fetched transactions in the order
+    /// they appear in blocks, whilst taking ownership of
+    /// the returned data.
     pub fn take(&mut self) -> impl IntoIterator<Item = IndexedNoteEntry> {
         std::mem::take(&mut self.txs)
     }
@@ -797,24 +806,6 @@ impl MaspClient for IndexerMaspClient {
     }
 }
 
-/// Where to fetch a range of masp txs from.
-pub enum FetchSource {
-    /// Get txs from cache.
-    Cache,
-    /// Get txs from a remote provider.
-    Remote,
-}
-
-/// Represents a fetch request in a certain (inclusive) block range.
-pub struct FetchRequestRange {
-    /// Where to fetch a range of masp txs from.
-    pub source: FetchSource,
-    /// The lower bound of the block range.
-    pub from: BlockHeight,
-    /// The upper bound of the block range.
-    pub to: BlockHeight,
-}
-
 /// Given a block height range we wish to request and a cache of fetched block
 /// heights, returns the set of sub-ranges we need to request so that all blocks
 /// in the inclusive range `[from, to]` get cached.
@@ -822,65 +813,42 @@ pub fn blocks_left_to_fetch(
     from: BlockHeight,
     to: BlockHeight,
     fetched: &Fetched,
-) -> Vec<FetchRequestRange> {
-    if from.0 == 0 || to.0 == 0 {
-        panic!("There is no height 0");
+) -> Vec<[BlockHeight; 2]> {
+    const ZERO: BlockHeight = BlockHeight(0);
+
+    if from > to {
+        panic!("Empty range passed to `blocks_left_to_fetch`, [{from}, {to}]");
+    }
+    if from == ZERO || to == ZERO {
+        panic!("Block height values start at 1");
     }
 
-    let mut requested_ranges = Vec::with_capacity((to.0 - from.0 + 1) as usize);
-
-    let mut fetch_current_from = from;
-    let mut cache_current_from = from;
-
+    let mut to_fetch = Vec::with_capacity((to.0 - from.0 + 1) as usize);
+    let mut current_from = from;
     let mut need_to_fetch = true;
 
-    for height in from.0..=to.0 {
-        let height_in_cache = fetched.contains_height(BlockHeight(height));
+    for height in (from.0..=to.0).map(BlockHeight) {
+        let height_in_cache = fetched.contains_height(height);
 
-        match (need_to_fetch, height_in_cache) {
-            (true, true) => {
-                // cross an upper gap boundary
-                if height > fetch_current_from.0 {
-                    requested_ranges.push(FetchRequestRange {
-                        from: fetch_current_from,
-                        to: BlockHeight(height - 1),
-                        source: FetchSource::Remote,
-                    });
-                }
-                cache_current_from = BlockHeight(height);
-                need_to_fetch = false;
+        // cross an upper gap boundary
+        if need_to_fetch && height_in_cache {
+            if height > current_from {
+                to_fetch.push([
+                    current_from,
+                    height.checked_sub(1).expect("Height is greater than zero"),
+                ]);
             }
-            (false, false) => {
-                // cross a lower gap boundary
-                if height > cache_current_from.0 {
-                    requested_ranges.push(FetchRequestRange {
-                        from: cache_current_from,
-                        to: BlockHeight(height - 1),
-                        source: FetchSource::Cache,
-                    });
-                }
-                fetch_current_from = BlockHeight(height);
-                need_to_fetch = true;
-            }
-            _ => {} // NOOP
+            need_to_fetch = false;
+        } else if !need_to_fetch && !height_in_cache {
+            // cross a lower gap boundary
+            current_from = height;
+            need_to_fetch = true;
         }
     }
-
     if need_to_fetch {
-        requested_ranges.push(FetchRequestRange {
-            from: fetch_current_from,
-            to,
-            source: FetchSource::Remote,
-        });
-    } else {
-        requested_ranges.push(FetchRequestRange {
-            from: fetch_current_from,
-            to,
-            source: FetchSource::Cache,
-        });
+        to_fetch.push([current_from, to]);
     }
-
-    requested_ranges
+    to_fetch
 }
 
 /// An enum to indicate how to track progress depending on

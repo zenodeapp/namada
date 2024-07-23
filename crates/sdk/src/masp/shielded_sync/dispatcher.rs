@@ -21,8 +21,7 @@ use crate::control_flow::ShutdownSignal;
 use crate::error::Error;
 use crate::masp::shielded_sync::trial_decrypt;
 use crate::masp::utils::{
-    blocks_left_to_fetch, DecryptedData, FetchRequestRange, FetchSource,
-    Fetched, RetryStrategy, TrialDecrypted,
+    blocks_left_to_fetch, DecryptedData, Fetched, RetryStrategy, TrialDecrypted,
 };
 use crate::masp::{
     to_viewing_key, ShieldedContext, ShieldedUtils, TxNoteMap, WitnessMap,
@@ -493,6 +492,10 @@ where
                 .min(initial_state.last_query_height.0);
             self.spawn_fetch_txs(BlockHeight(from), BlockHeight(to));
         }
+
+        for (itx, txs) in self.cache.fetched.iter() {
+            self.spawn_trial_decryptions(*itx, txs);
+        }
     }
 
     fn handle_incoming_message(&mut self, message: Message) {
@@ -573,97 +576,69 @@ where
     }
 
     fn spawn_update_witness_map(&mut self, height: BlockHeight) {
-        match self.cache.witness_map.take() {
-            Some((h, wm)) if h == height => {
-                self.spawn_sync(move |_| Message::UpdateWitnessMap(Ok(wm)))
-            }
-            _ => {
-                let client = self.client.clone();
-                self.spawn_async(Box::pin(async move {
-                    Message::UpdateWitnessMap(
-                        client.fetch_witness_map(height).await.map_err(
-                            |error| TaskError {
-                                error,
-                                context: height,
-                            },
-                        ),
-                    )
-                }))
-            }
+        if pre_built_in_cache(self.cache.witness_map.as_ref(), height) {
+            return;
         }
+        let client = self.client.clone();
+        self.spawn_async(Box::pin(async move {
+            Message::UpdateWitnessMap(
+                client.fetch_witness_map(height).await.map_err(|error| {
+                    TaskError {
+                        error,
+                        context: height,
+                    }
+                }),
+            )
+        }));
     }
 
     fn spawn_update_commitment_tree(&mut self, height: BlockHeight) {
-        match self.cache.commitment_tree.take() {
-            Some((h, ct)) if h == height => {
-                self.spawn_sync(move |_| Message::UpdateCommitmentTree(Ok(ct)))
-            }
-            _ => {
-                let client = self.client.clone();
-                self.spawn_async(Box::pin(async move {
-                    Message::UpdateCommitmentTree(
-                        client.fetch_commitment_tree(height).await.map_err(
-                            |error| TaskError {
-                                error,
-                                context: height,
-                            },
-                        ),
-                    )
-                }));
-            }
+        if pre_built_in_cache(self.cache.commitment_tree.as_ref(), height) {
+            return;
         }
+        let client = self.client.clone();
+        self.spawn_async(Box::pin(async move {
+            Message::UpdateCommitmentTree(
+                client.fetch_commitment_tree(height).await.map_err(|error| {
+                    TaskError {
+                        error,
+                        context: height,
+                    }
+                }),
+            )
+        }));
     }
 
     fn spawn_update_tx_notes_map(&mut self, height: BlockHeight) {
-        match self.cache.tx_note_map.take() {
-            Some((h, nm)) if h == height => {
-                self.spawn_sync(move |_| Message::UpdateNotesMap(Ok(nm)))
-            }
-            _ => {
-                let client = self.client.clone();
-                self.spawn_async(Box::pin(async move {
-                    Message::UpdateNotesMap(
-                        client.fetch_tx_notes_map(height).await.map_err(
-                            |error| TaskError {
-                                error,
-                                context: height,
-                            },
-                        ),
-                    )
-                }));
-            }
+        if pre_built_in_cache(self.cache.tx_note_map.as_ref(), height) {
+            return;
         }
+        let client = self.client.clone();
+        self.spawn_async(Box::pin(async move {
+            Message::UpdateNotesMap(
+                client.fetch_tx_notes_map(height).await.map_err(|error| {
+                    TaskError {
+                        error,
+                        context: height,
+                    }
+                }),
+            )
+        }));
     }
 
     fn spawn_fetch_txs(&self, from: BlockHeight, to: BlockHeight) {
-        for FetchRequestRange { from, to, source } in
-            blocks_left_to_fetch(from, to, &self.cache.fetched)
-        {
-            match source {
-                FetchSource::Remote => {
-                    let client = self.client.clone();
-                    self.spawn_async(Box::pin(async move {
-                        Message::FetchTxs(
-                            client
-                                .fetch_shielded_transfers(from, to)
-                                .await
-                                .map_err(|error| TaskError {
-                                    error,
-                                    context: [from, to],
-                                }),
-                        )
-                    }));
-                }
-                FetchSource::Cache => {
-                    let tx_batch = self
-                        .cache
-                        .fetched
-                        .txs_in_range(from, to)
-                        .map(|(indexed_tx, txs)| (*indexed_tx, txs.clone()))
-                        .collect();
-                    self.spawn_sync(move |_| Message::FetchTxs(Ok(tx_batch)));
-                }
-            }
+        for [from, to] in blocks_left_to_fetch(from, to, &self.cache.fetched) {
+            let client = self.client.clone();
+            self.spawn_async(Box::pin(async move {
+                Message::FetchTxs(
+                    client.fetch_shielded_transfers(from, to).await.map_err(
+                        |error| TaskError {
+                            error,
+                            context: [from, to],
+                        },
+                    ),
+                )
+            }));
         }
     }
 
@@ -672,12 +647,7 @@ where
             for vk in self.ctx.vk_heights.keys() {
                 let vk = *vk;
 
-                if let Some(decrypted_data) =
-                    self.cache.trial_decrypted.get(&itx, &vk)
-                {
-                    let dd = decrypted_data.clone();
-                    self.spawn_sync(move |_| Message::TrialDecrypt(itx, vk, dd))
-                } else {
+                if self.cache.trial_decrypted.get(&itx, &vk).is_none() {
                     let tx = tx.clone();
                     self.spawn_sync(move |interrupt| {
                         Message::TrialDecrypt(
@@ -731,4 +701,12 @@ where
             sender.send(job(interrupt)).unwrap();
         });
     }
+}
+
+#[inline(always)]
+fn pre_built_in_cache<T>(
+    pre_built_data: Option<&(BlockHeight, T)>,
+    desired_height: BlockHeight,
+) -> bool {
+    matches!(pre_built_data, Some((h, _)) if *h == desired_height)
 }
