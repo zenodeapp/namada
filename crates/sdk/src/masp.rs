@@ -1,8 +1,7 @@
 //! MASP verification wrappers.
 
 mod shielded_sync;
-//#[cfg(test)]
-#[cfg(FALSE)]
+#[cfg(test)]
 mod test_utils;
 
 use std::cmp::Ordering;
@@ -3381,7 +3380,7 @@ pub mod fs {
     /// An implementation of ShieldedUtils for standard filesystems
     pub struct FsShieldedUtils {
         #[borsh(skip)]
-        context_dir: PathBuf,
+        pub(crate) context_dir: PathBuf,
     }
 
     impl FsShieldedUtils {

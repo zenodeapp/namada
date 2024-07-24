@@ -1,17 +1,19 @@
+use core::str::FromStr;
 use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 
 use borsh::BorshDeserialize;
 use masp_primitives::merkle_tree::{CommitmentTree, IncrementalWitness};
-use masp_primitives::sapling::Node;
+use masp_primitives::sapling::{Node, ViewingKey};
 use masp_primitives::transaction::Transaction;
+use masp_primitives::zip32::ExtendedFullViewingKey;
 use namada_core::collections::HashMap;
 use namada_core::storage::BlockHeight;
 use namada_state::LastBlock;
 use namada_tx::IndexedTx;
 use tendermint_rpc::SimpleRequest;
-
+use namada_core::masp::ExtendedViewingKey;
 use crate::error::Error;
 use crate::io::Io;
 use crate::masp::utils::{
@@ -23,6 +25,14 @@ use crate::queries::{Client, EncodedResponseQuery, Rpc, RPC};
 
 /// A viewing key derived from A_SPENDING_KEY
 pub const AA_VIEWING_KEY: &str = "zvknam1qqqqqqqqqqqqqq9v0sls5r5de7njx8ehu49pqgmqr9ygelg87l5x8y4s9r0pjlvu6x74w9gjpw856zcu826qesdre628y6tjc26uhgj6d9zqur9l5u3p99d9ggc74ald6s8y3sdtka74qmheyqvdrasqpwyv2fsmxlz57lj4grm2pthzj3sflxc0jx0edrakx3vdcngrfjmru8ywkguru8mxss2uuqxdlglaz6undx5h8w7g70t2es850g48xzdkqay5qs0yw06rtxcpjdve6";
+
+pub fn arbitrary_vk() -> ViewingKey {
+   ExtendedFullViewingKey::from(
+        ExtendedViewingKey::from_str(AA_VIEWING_KEY).expect("Test failed"),
+    )
+    .fvk
+    .vk
+}
 
 /// A serialized transaction that will work for testing.
 /// Would love to do this in a less opaque fashion, but
@@ -128,102 +138,28 @@ pub(super) fn arbitrary_masp_tx() -> Transaction {
     .expect("Test failed")
 }
 
-/// A client for testing the shielded-sync functionality
-pub struct TestingClient {
-    /// An actual mocked client for querying
-    inner: TestClient<Rpc>,
-    /// Used to inject a channel that we control into
-    /// the fetch algorithm. The option is to mock connection
-    /// failures.
-    next_masp_txs: flume::Receiver<Option<IndexedNoteEntry>>,
-}
-
-impl Deref for TestingClient {
-    type Target = TestClient<Rpc>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl DerefMut for TestingClient {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
-#[cfg(any(test, feature = "async-client"))]
-#[cfg_attr(feature = "async-send", async_trait::async_trait)]
-#[cfg_attr(not(feature = "async-send"), async_trait::async_trait(?Send))]
-impl Client for TestingClient {
-    type Error = std::io::Error;
-
-    async fn request(
-        &self,
-        path: String,
-        data: Option<Vec<u8>>,
-        height: Option<BlockHeight>,
-        prove: bool,
-    ) -> Result<EncodedResponseQuery, Self::Error> {
-        self.inner.request(path, data, height, prove).await
-    }
-
-    async fn perform<R>(
-        &self,
-        request: R,
-    ) -> Result<R::Output, tendermint_rpc::Error>
-    where
-        R: SimpleRequest,
-    {
-        self.inner.perform(request).await
-    }
-}
-
-/// Creat a test client for unit testing as well
-/// as a channel for communicating with it.
-pub fn test_client(
-    last_height: BlockHeight,
-) -> (TestingClient, flume::Sender<Option<IndexedNoteEntry>>) {
-    let (sender, recv) = flume::unbounded();
-    let mut client = TestClient::new(RPC);
-    client.state.in_mem_mut().last_block = Some(LastBlock {
-        height: last_height,
-        time: Default::default(),
-    });
-    (
-        TestingClient {
-            inner: client,
-            next_masp_txs: recv,
-        },
-        sender,
-    )
-}
-
 /// A client for unit tests. It "fetches" a new note
 /// when a channel controlled by the unit test sends
 /// it one.
 #[derive(Clone)]
-pub struct TestingMaspClient<'a> {
-    client: &'a TestingClient,
+pub struct TestingMaspClient {
+    last_height: BlockHeight
 }
 
-impl<'client> TestingMaspClient<'client> {
+impl TestingMaspClient {
     /// Create a new [`TestingMaspClient`] given an rpc client
     /// [`TestingClient`].
-    pub const fn new(client: &'client TestingClient) -> Self {
-        Self { client }
+    pub const fn new(last_height: BlockHeight) -> Self {
+        Self {
+            last_height,
+        }
     }
 }
 
-impl MaspClient for TestingMaspClient<'_> {
+impl MaspClient for TestingMaspClient {
     async fn last_block_height(&self) -> Result<Option<BlockHeight>, Error> {
-        Ok(self
-            .client
-            .state
-            .in_mem()
-            .last_block
-            .as_ref()
-            .map(|b| b.height))
+        Ok(Some(self.last_height))
+
     }
 
     async fn fetch_shielded_transfers(
@@ -234,17 +170,7 @@ impl MaspClient for TestingMaspClient<'_> {
         let mut txs = vec![];
 
         for _height in from.0..=to.0 {
-            let next_tx = self
-                .client
-                .next_masp_txs
-                .recv()
-                .expect("Test failed")
-                .ok_or_else(|| {
-                    Error::Other(
-                        "Connection to fetch MASP txs failed".to_string(),
-                    )
-                })?;
-            txs.push(next_tx);
+            todo!()
         }
 
         Ok(txs)

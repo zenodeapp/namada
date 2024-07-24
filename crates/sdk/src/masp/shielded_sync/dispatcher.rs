@@ -200,8 +200,8 @@ enum DispatcherState {
     Errored(Error),
 }
 
+#[derive(Default, Debug)]
 struct InitialState {
-    #[allow(dead_code)] // TODO: remove dead code attr
     last_witnessed_tx: Option<IndexedTx>,
     start_height: BlockHeight,
     last_query_height: BlockHeight,
@@ -709,4 +709,59 @@ fn pre_built_in_cache<T>(
     desired_height: BlockHeight,
 ) -> bool {
     matches!(pre_built_data, Some((h, _)) if *h == desired_height)
+}
+
+#[cfg(test)]
+mod dispatcher_tests {
+    use std::collections::BTreeMap;
+    use tempfile::tempdir;
+    use namada_core::storage::BlockHeight;
+    use namada_tx::IndexedTx;
+    use crate::masp::fs::FsShieldedUtils;
+    use crate::masp::ShieldedSyncConfig;
+    use crate::masp::test_utils::{arbitrary_vk, TestingMaspClient};
+    use crate::task_env::{LocalSetTaskEnvironment, TaskEnvironment};
+
+    #[tokio::test]
+    async fn test_applying_cache_drains_decrypted_data() {
+        let client = TestingMaspClient::new(BlockHeight::first());
+        let config = ShieldedSyncConfig::builder().client(client).build();
+        let temp_dir = tempdir().unwrap();
+        let utils = FsShieldedUtils {
+            context_dir:  temp_dir.path().to_path_buf(),
+        };
+        let spawner = LocalSetTaskEnvironment::new(4)
+            .expect("Test failed")
+            .run(|s| async {
+                let mut dispatcher = config.dispatcher(s, &utils).await;
+                // fill up the dispatcher's cache
+                for h in 0u64..10 {
+                    let itx = IndexedTx {
+                        height: h.into(),
+                        index: Default::default(),
+                    };
+                    dispatcher.cache.fetched.insert((
+                        itx,
+                        vec![],
+                    ));
+                    dispatcher.ctx.tx_note_map.insert(itx, h as usize);
+                    dispatcher.cache.trial_decrypted.insert(
+                        itx,
+                        arbitrary_vk(),
+                        vec![],
+                    )
+                }
+
+                dispatcher.apply_cache_to_shielded_context(
+                    &Default::default()
+                ).expect("Test failed");
+                assert!(dispatcher.cache.fetched.is_empty());
+                assert!(dispatcher.cache.trial_decrypted.is_empty());
+                let expected = BTreeMap::from([(
+                    arbitrary_vk(),
+                    Some(IndexedTx{ height: 9.into(), index: Default::default() })
+                )]);
+                assert_eq!(expected, dispatcher.ctx.vk_heights);
+            });
+    }
 }

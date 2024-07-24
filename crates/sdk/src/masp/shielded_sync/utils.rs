@@ -74,6 +74,11 @@ impl TrialDecrypted {
     ) {
         self.inner.entry(itx).or_default().insert(vk, notes);
     }
+
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
 }
 
 /// A cache of fetched indexed transactions.
