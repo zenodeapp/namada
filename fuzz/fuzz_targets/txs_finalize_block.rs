@@ -1,4 +1,5 @@
 #![no_main]
+#![allow(clippy::disallowed_methods)]
 
 use data_encoding::HEXUPPER;
 use libfuzzer_sys::fuzz_target;
