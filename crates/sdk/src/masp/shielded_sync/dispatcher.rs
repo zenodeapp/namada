@@ -467,6 +467,7 @@ where
         if shutdown_signal.received() {
             tracing::info!("Interrupt received, shutting down shielded sync");
             self.state = DispatcherState::Interrupted;
+            self.interrupt_flag.set();
         }
     }
 
@@ -763,5 +764,57 @@ mod dispatcher_tests {
                 )]);
                 assert_eq!(expected, dispatcher.ctx.vk_heights);
             });
+    }
+}
+#[cfg(test)]
+mod test_dispatcher_tasks {
+    use super::*;
+    use crate::task_env::{LocalSetTaskEnvironment, TaskEnvironment};
+
+    #[tokio::test]
+    async fn test_async_counter_on_async_interrupt() {
+        LocalSetTaskEnvironment::new(1)
+            .unwrap()
+            .run(|spawner| async move {
+                let active_tasks = AsyncCounter::new();
+                let interrupt = {
+                    let int = AtomicFlag::default();
+
+                    // preemptively set the task to an
+                    // interrupted state
+                    int.set();
+
+                    int
+                };
+
+                // clone the active tasks handle,
+                // to increment its internal ref count
+                let guard = active_tasks.clone();
+
+                let mut future = Box::pin(async move {
+                    let _guard = guard;
+
+                    // this future never yields, so the only
+                    // wait to early exit is to be interrupted
+                    // through the wrapped future
+                    std::future::pending::<()>().await;
+                });
+                let interruptable_future = std::future::poll_fn(move |cx| {
+                    if interrupt.get() {
+                        // early exit here, by checking the interrupt state,
+                        // which we immediately set above
+                        Poll::Ready(())
+                    } else {
+                        Pin::new(&mut future).poll(cx)
+                    }
+                });
+
+                spawner.spawn_async(interruptable_future);
+
+                // sync with the spawned future by waiting
+                // for the active tasks counter to reach zero
+                active_tasks.await;
+            })
+            .await;
     }
 }
