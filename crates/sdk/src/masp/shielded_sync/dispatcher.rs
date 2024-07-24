@@ -380,11 +380,11 @@ where
                     self.ctx.save_decrypted_shielded_outputs(
                         vk, note_pos, note, pa, memo,
                     )?;
-                    self.ctx.save_shielded_spends(&stx_batch);
                     note_pos += 1;
                 }
                 *h = Some(indexed_tx);
             }
+            self.ctx.save_shielded_spends(&stx_batch);
             std::mem::swap(&mut vk_heights, &mut self.ctx.vk_heights);
         }
 
