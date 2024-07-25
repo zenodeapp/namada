@@ -2457,7 +2457,7 @@ fn get_gaia_denom_hash(denom: impl AsRef<str>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(denom.as_ref());
     let hash = hasher.finalize();
-    format!("ibc/{hash:X}")
+    format!("ibc/{hash:MaspLocalTaskEnv}")
 }
 
 fn check_gaia_balance(

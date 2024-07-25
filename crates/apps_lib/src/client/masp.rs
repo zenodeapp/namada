@@ -11,7 +11,7 @@ use namada_sdk::masp::utils::{
     IndexedNoteEntry, IndexerMaspClient, LedgerMaspClient, PeekableIter,
     ProgressTracker, ProgressType,
 };
-use namada_sdk::masp::{ShieldedContext, ShieldedSyncConfig, ShieldedUtils};
+use namada_sdk::masp::{MaspLocalTaskEnv, ShieldedContext, ShieldedSyncConfig, ShieldedUtils};
 use namada_sdk::queries::Client;
 use namada_sdk::storage::BlockHeight;
 use namada_sdk::task_env::LocalSetTaskEnvironment;
@@ -46,7 +46,7 @@ pub async fn syncing<
         );
     }
     display_line!(io, "\n\n");
-    let env = LocalSetTaskEnvironment::new(500)?;
+    let env = MaspLocalTaskEnv::new(500)?;
 
     macro_rules! dispatch_client {
         ($client:expr) => {{

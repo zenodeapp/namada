@@ -1,6 +1,5 @@
 use core::str::FromStr;
 use std::collections::BTreeMap;
-use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 
 use borsh::BorshDeserialize;
@@ -10,9 +9,7 @@ use masp_primitives::transaction::Transaction;
 use masp_primitives::zip32::ExtendedFullViewingKey;
 use namada_core::collections::HashMap;
 use namada_core::storage::BlockHeight;
-use namada_state::LastBlock;
 use namada_tx::IndexedTx;
-use tendermint_rpc::SimpleRequest;
 use namada_core::masp::ExtendedViewingKey;
 use crate::error::Error;
 use crate::io::Io;
@@ -20,8 +17,6 @@ use crate::masp::utils::{
     IndexedNoteEntry, IterProgress, MaspClient, MaspClientCapabilities,
     PeekableIter, ProgressTracker,
 };
-use crate::queries::testing::TestClient;
-use crate::queries::{Client, EncodedResponseQuery, Rpc, RPC};
 
 /// A viewing key derived from A_SPENDING_KEY
 pub const AA_VIEWING_KEY: &str = "zvknam1qqqqqqqqqqqqqq9v0sls5r5de7njx8ehu49pqgmqr9ygelg87l5x8y4s9r0pjlvu6x74w9gjpw856zcu826qesdre628y6tjc26uhgj6d9zqur9l5u3p99d9ggc74ald6s8y3sdtka74qmheyqvdrasqpwyv2fsmxlz57lj4grm2pthzj3sflxc0jx0edrakx3vdcngrfjmru8ywkguru8mxss2uuqxdlglaz6undx5h8w7g70t2es850g48xzdkqay5qs0yw06rtxcpjdve6";
@@ -167,10 +162,10 @@ impl MaspClient for TestingMaspClient {
         from: BlockHeight,
         to: BlockHeight,
     ) -> Result<Vec<IndexedNoteEntry>, Error> {
-        let mut txs = vec![];
+        let txs = vec![];
 
         for _height in from.0..=to.0 {
-            todo!()
+
         }
 
         Ok(txs)

@@ -2,8 +2,6 @@
 
 use std::future::Future;
 
-use crate::error::Error;
-
 /// Spawn tasks onto a thread pool.
 pub trait TaskSpawner {
     /// Spawn an async task onto a thread pool.
@@ -69,14 +67,8 @@ mod environment {
 
     impl LocalSetTaskEnvironment {
         /// Create a new [`LocalSetTaskEnvironment`] with `num_threads` workers.
-        pub fn new(num_threads: usize) -> Result<Self, Error> {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(num_threads)
-                .build()
-                .map_err(|err| {
-                    Error::Other(format!("Failed to create thread pool: {err}"))
-                })?;
-            Ok(Self { pool })
+        pub fn new(pool: rayon::ThreadPool) -> Self {
+            Self { pool }
         }
     }
 

@@ -371,9 +371,6 @@ where
                 .iter_mut()
                 .filter(|(_vk, h)| h.as_ref() < Some(&indexed_tx))
             {
-                // TODO: test that we drain the entire cache of
-                // decrypted notes (i.e.
-                // `self.cache.trial_decrypted.is_empty()`)
                 for (note, pa, memo) in self
                     .cache
                     .trial_decrypted
@@ -715,13 +712,18 @@ fn pre_built_in_cache<T>(
 #[cfg(test)]
 mod dispatcher_tests {
     use std::collections::BTreeMap;
+    use std::hint::spin_loop;
+    use futures::join;
     use tempfile::tempdir;
     use namada_core::storage::BlockHeight;
     use namada_tx::IndexedTx;
+
+    use super::*;
+    use crate::control_flow::testing_shutdown_signal;
     use crate::masp::fs::FsShieldedUtils;
-    use crate::masp::ShieldedSyncConfig;
+    use crate::masp::{MaspLocalTaskEnv, ShieldedSyncConfig};
     use crate::masp::test_utils::{arbitrary_vk, TestingMaspClient};
-    use crate::task_env::{LocalSetTaskEnvironment, TaskEnvironment};
+    use crate::task_env::TaskEnvironment;
 
     #[tokio::test]
     async fn test_applying_cache_drains_decrypted_data() {
@@ -731,10 +733,11 @@ mod dispatcher_tests {
         let utils = FsShieldedUtils {
             context_dir:  temp_dir.path().to_path_buf(),
         };
-        let spawner = LocalSetTaskEnvironment::new(4)
+        MaspLocalTaskEnv::new(4)
             .expect("Test failed")
             .run(|s| async {
                 let mut dispatcher = config.dispatcher(s, &utils).await;
+                dispatcher.ctx.vk_heights = BTreeMap::from([(arbitrary_vk(), None)]);
                 // fill up the dispatcher's cache
                 for h in 0u64..10 {
                     let itx = IndexedTx {
@@ -763,18 +766,13 @@ mod dispatcher_tests {
                     Some(IndexedTx{ height: 9.into(), index: Default::default() })
                 )]);
                 assert_eq!(expected, dispatcher.ctx.vk_heights);
-            });
+            }).await;
     }
-}
-#[cfg(test)]
-mod test_dispatcher_tasks {
-    use super::*;
-    use crate::task_env::{LocalSetTaskEnvironment, TaskEnvironment};
 
     #[tokio::test]
     async fn test_async_counter_on_async_interrupt() {
-        LocalSetTaskEnvironment::new(1)
-            .unwrap()
+        MaspLocalTaskEnv::new(1)
+            .expect("Test failed")
             .run(|spawner| async move {
                 let active_tasks = AsyncCounter::new();
                 let interrupt = {
@@ -816,5 +814,95 @@ mod test_dispatcher_tasks {
                 active_tasks.await;
             })
             .await;
+    }
+
+    /// This test checks that a (sync / async) thread panicking
+    /// * allows existing tasks to finish,
+    /// * sets the panic flag
+    /// * dispatcher returns the expected error
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_panic_flag() {
+        test_panic_flag_aux(true).await;
+        test_panic_flag_aux(false).await;
+    }
+
+    async fn test_panic_flag_aux(sync: bool) {
+        let client = TestingMaspClient::new(BlockHeight::first());
+        let config = ShieldedSyncConfig::builder().client(client).build();
+        let temp_dir = tempdir().unwrap();
+        let utils = FsShieldedUtils {
+            context_dir:  temp_dir.path().to_path_buf(),
+        };
+        _ = MaspLocalTaskEnv::new(4)
+            .expect("Test failed")
+            .run(|s| async {
+                let dispatcher = config.dispatcher(s, &utils).await;
+
+                let barrier = Arc::new(tokio::sync::Barrier::new(11));
+                for _ in 0 .. 10 {
+                    let barrier = barrier.clone();
+                    dispatcher.spawn_async(Box::pin(async move {
+                        barrier.wait().await;
+                        Message::UpdateWitnessMap(Err(TaskError {
+                            error: Error::Other("Test".to_string()),
+                            context: BlockHeight::first(),
+                        }))
+                    }));
+                }
+                assert!(!dispatcher.tasks.panic_flag.panicked());
+                // panic a thread
+                if sync {
+                    dispatcher.spawn_sync(|_| { panic!("OH NOES!")});
+                } else {
+                    dispatcher.spawn_async(Box::pin(async { panic!("OH NOES!") }));
+                }
+
+                // run the dispatcher
+                let (_sender, shutdown_signal) = testing_shutdown_signal();
+                let flag = dispatcher.tasks.panic_flag.clone();
+                let dispatcher_fut = dispatcher.run(shutdown_signal, Some(BlockHeight::first()), Some(BlockHeight(10)), &[], &[]);
+
+                // we poll the dispatcher future until the panic thread has panicked.
+                let wanker = Arc::new(AtomicWaker::new());
+                let _ = {
+                    let flag = flag.clone();
+                    let wanker = wanker.clone();
+                    std::thread::spawn(move || {
+                        while !flag.panicked() {
+                            spin_loop();
+                        }
+                        wanker.wake()
+                    })
+                };
+                let panicked_fut = std::future::poll_fn(move |cx| {
+                    if flag.panicked() {
+                        Poll::Ready(())
+                    } else {
+                        wanker.register(cx.waker());
+                        Poll::Pending
+                    }
+                });
+
+                // we assert that the panic thread panicked and retrieve the
+                // dispatcher future
+                let Either::Right((_, fut)) =
+                    select(Box::pin(dispatcher_fut), Box::pin(panicked_fut)).await else {
+                    panic!("Test failed")
+                };
+
+                let (_, res) = join! {
+                    barrier.wait(),
+                    fut,
+                };
+
+                let Err(Error::Other(ref msg)) = res else {
+                    panic!("Test failed")
+                };
+
+                assert_eq!(
+                    msg,
+                    "A worker thread panicked during the shielded sync",
+                );
+            }).await;
     }
 }

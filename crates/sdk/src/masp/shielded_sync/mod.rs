@@ -1,3 +1,4 @@
+use std::future::Future;
 use masp_primitives::sapling::note_encryption::{
     try_sapling_note_decryption, PreparedIncomingViewingKey,
 };
@@ -5,11 +6,12 @@ use masp_primitives::sapling::ViewingKey;
 use masp_primitives::transaction::components::OutputDescription;
 use masp_primitives::transaction::{Authorization, Authorized, Transaction};
 use typed_builder::TypedBuilder;
-
+use crate::error::Error;
 use super::shielded_sync::utils::{MaspClient, RetryStrategy};
 use crate::masp::shielded_sync::dispatcher::{AtomicFlag, Dispatcher};
 use crate::masp::utils::DecryptedData;
 use crate::masp::{ShieldedUtils, NETWORK};
+use crate::task_env::{LocalSetSpawner, LocalSetTaskEnvironment, TaskEnvironment};
 
 pub mod dispatcher;
 pub mod utils;
@@ -28,6 +30,39 @@ pub struct ShieldedSyncConfig<M> {
     channel_buffer_size: usize,
     #[builder(default = DEFAULT_BATCH_SIZE)]
     block_batch_size: usize,
+}
+
+/// A task env whose backing thread-pool uses a no-op
+/// panic handler. Custom for MASP dispatchers.
+#[cfg(not(target_family = "wasm"))]
+pub struct MaspLocalTaskEnv(LocalSetTaskEnvironment);
+
+#[cfg(not(target_family = "wasm"))]
+impl MaspLocalTaskEnv {
+    /// create a new [`MaspLocalTaskEnv`]
+    pub fn new(num_threads: usize) -> Result<Self, Error> {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .panic_handler(|_| {})
+            .build()
+            .map_err(|err| {
+                Error::Other(format!("Failed to create thread pool: {err}"))
+            })?;
+        Ok(Self(LocalSetTaskEnvironment::new(pool)))
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl TaskEnvironment for MaspLocalTaskEnv {
+    type Spawner = LocalSetSpawner;
+
+    async fn run<M, F, R>(self, main: M) -> R
+    where
+        M: FnOnce(Self::Spawner) -> F,
+        F: Future<Output=R>
+    {
+        self.0.run(main).await
+    }
 }
 
 impl<M> ShieldedSyncConfig<M>

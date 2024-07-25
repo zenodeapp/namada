@@ -76,6 +76,8 @@ use crate::masp::shielded_sync::utils::MaspClient;
 pub use crate::masp::shielded_sync::{
     utils, ShieldedSyncConfig, ShieldedSyncConfigBuilder,
 };
+#[cfg(not(target_family = "wasm"))]
+pub use crate::masp::shielded_sync::MaspLocalTaskEnv;
 use crate::queries::Client;
 use crate::rpc::{query_conversion, query_denom};
 use crate::task_env::TaskEnvironment;
