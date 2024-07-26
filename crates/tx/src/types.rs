@@ -1429,13 +1429,19 @@ impl Tx {
                 // Check that the hashes being checked are a subset of those in
                 // this section. Also ensure that all the sections the signature
                 // signs over are present.
-                if hashes.iter().all(|x| {
+                let matching_hashes = hashes.iter().all(|x| {
                     signatures.targets.contains(x) || section.get_hash() == *x
                 }) && signatures
                     .targets
                     .iter()
-                    .all(|x| self.get_section(x).is_some())
-                {
+                    .all(|x| self.get_section(x).is_some());
+
+                #[cfg(fuzzing)]
+                let _ = matching_hashes;
+                #[cfg(fuzzing)]
+                let matching_hashes = true;
+
+                if matching_hashes {
                     // Finally verify that the signature itself is valid
                     let amt_verifieds = signatures
                         .verify_signature(
