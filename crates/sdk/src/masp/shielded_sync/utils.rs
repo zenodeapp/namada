@@ -1,7 +1,7 @@
 //! Helper functions and types
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use masp_primitives::memo::MemoBytes;
@@ -13,7 +13,6 @@ use namada_core::storage::{BlockHeight, TxIndex};
 use namada_tx::{IndexedTx, IndexedTxRange, Tx};
 
 use crate::error::{Error, QueryError};
-use crate::io::Io;
 use crate::masp::{
     extract_masp_tx, extract_masp_tx_from_ibc_message,
     get_indexed_masp_events_at_height,
@@ -33,7 +32,7 @@ pub type IndexedNoteEntryRefs<'a> = (&'a IndexedTx, &'a Vec<Transaction>);
 pub type DecryptedData = (Note, PaymentAddress, MemoBytes);
 
 /// Cache of decrypted notes.
-#[derive(Default)]
+#[derive(Default, BorshSerialize, BorshDeserialize)]
 pub struct TrialDecrypted {
     inner: HashMap<IndexedTx, HashMap<ViewingKey, Vec<DecryptedData>>>,
 }
@@ -88,7 +87,7 @@ impl TrialDecrypted {
 /// a given height, or none.
 #[derive(Debug, Default, Clone, BorshSerialize, BorshDeserialize)]
 pub struct Fetched {
-    txs: IndexedNoteData,
+    pub(crate) txs: IndexedNoteData,
 }
 
 impl Fetched {
@@ -129,46 +128,6 @@ impl Fetched {
             .is_some()
     }
 
-    /// Check if this cache has already been populated for a given
-    /// block height.
-    pub fn txs_in_range(
-        &self,
-        from: BlockHeight,
-        to: BlockHeight,
-    ) -> impl Iterator<Item = IndexedNoteEntryRefs<'_>> + '_ {
-        self.txs.range(IndexedTxRange::between_heights(from, to))
-    }
-
-    /// We remove all indices from blocks that have been entirely scanned.
-    /// If a block is only partially scanned, we leave all the events in the
-    /// cache.
-    pub fn scanned(&mut self, ix: &IndexedTx) {
-        self.txs.retain(|i, _| i.height >= ix.height);
-    }
-
-    /// Gets the latest block height present in the cache
-    pub fn latest_height(&self) -> BlockHeight {
-        self.txs
-            .keys()
-            .max_by_key(|ix| ix.height)
-            .map(|ix| ix.height)
-            .unwrap_or_default()
-    }
-
-    /// Gets the first block height present in the cache
-    pub fn first_height(&self) -> BlockHeight {
-        self.txs
-            .keys()
-            .min_by_key(|ix| ix.height)
-            .map(|ix| ix.height)
-            .unwrap_or_default()
-    }
-
-    /// Remove the first entry from the cache and return it.
-    pub fn pop_first(&mut self) -> Option<IndexedNoteEntry> {
-        self.txs.pop_first()
-    }
-
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.txs.is_empty()
@@ -188,6 +147,7 @@ impl IntoIterator for Fetched {
 /// When retrying to fetch all notes in a
 /// loop, this dictates the strategy for
 /// how many attempts should be made.
+#[derive(Copy, Clone)]
 pub enum RetryStrategy {
     /// Always retry
     Forever,
@@ -487,11 +447,6 @@ impl IndexerMaspClient {
 
 #[cfg(not(target_family = "wasm"))]
 impl MaspClient for IndexerMaspClient {
-    #[inline(always)]
-    fn capabilities(&self) -> MaspClientCapabilities {
-        MaspClientCapabilities::AllData
-    }
-
     async fn last_block_height(&self) -> Result<Option<BlockHeight>, Error> {
         use serde::Deserialize;
 
@@ -638,6 +593,11 @@ impl MaspClient for IndexerMaspClient {
         }
 
         Ok(txs)
+    }
+
+    #[inline(always)]
+    fn capabilities(&self) -> MaspClientCapabilities {
+        MaspClientCapabilities::AllData
     }
 
     async fn fetch_commitment_tree(
@@ -854,153 +814,6 @@ pub fn blocks_left_to_fetch(
         to_fetch.push([current_from, to]);
     }
     to_fetch
-}
-
-/// An enum to indicate how to track progress depending on
-/// whether sync is currently fetch or scanning blocks.
-#[derive(Debug, Copy, Clone)]
-pub enum ProgressType {
-    /// Fetch
-    Fetch,
-    /// Scan
-    Scan,
-}
-
-/// A peekable iterator interface
-pub trait PeekableIter<I> {
-    /// Peek at next element
-    fn peek(&mut self) -> Option<&I>;
-
-    /// get next element
-    fn next(&mut self) -> Option<I>;
-}
-
-impl<I, J> PeekableIter<J> for std::iter::Peekable<I>
-where
-    I: Iterator<Item = J>,
-{
-    fn peek(&mut self) -> Option<&J> {
-        self.peek()
-    }
-
-    fn next(&mut self) -> Option<J> {
-        <Self as Iterator>::next(self)
-    }
-}
-
-/// This trait keeps track of how much progress the
-/// shielded sync algorithm has made relative to the inputs.
-///
-/// It should track how much has been fetched and scanned and
-/// whether the fetching has been finished.
-///
-/// Additionally, it has access to IO in case the struct implementing
-/// this trait wishes to log this progress.
-pub trait ProgressTracker<IO: Io> {
-    /// Get an IO handle
-    fn io(&self) -> &IO;
-
-    /// Return an iterator to fetched shielded transfers
-    fn fetch<I>(&self, items: I) -> impl PeekableIter<u64>
-    where
-        I: Iterator<Item = u64>;
-
-    /// Return an iterator over MASP transactions to be scanned
-    fn scan<I>(
-        &self,
-        items: I,
-    ) -> impl Iterator<Item = IndexedNoteEntry> + Send
-    where
-        I: Iterator<Item = IndexedNoteEntry> + Send;
-
-    /// The number of blocks that need to be fetched
-    fn left_to_fetch(&self) -> usize;
-}
-
-/// The default type for tracking the progress of shielded-sync.
-#[derive(Debug, Clone)]
-pub struct DefaultTracker<'io, IO: Io> {
-    io: &'io IO,
-    progress: Arc<Mutex<IterProgress>>,
-}
-
-impl<'io, IO: Io> DefaultTracker<'io, IO> {
-    /// New [`DefaultTracker`]
-    pub fn new(io: &'io IO) -> Self {
-        Self {
-            io,
-            progress: Arc::new(Mutex::new(Default::default())),
-        }
-    }
-}
-
-#[derive(Default, Copy, Clone, Debug)]
-pub(in crate::masp) struct IterProgress {
-    pub index: usize,
-    pub length: usize,
-}
-
-pub(in crate::masp) struct DefaultFetchIterator<I>
-where
-    I: Iterator<Item = u64>,
-{
-    pub inner: I,
-    pub progress: Arc<Mutex<IterProgress>>,
-    pub peeked: Option<u64>,
-}
-
-impl<I> PeekableIter<u64> for DefaultFetchIterator<I>
-where
-    I: Iterator<Item = u64>,
-{
-    fn peek(&mut self) -> Option<&u64> {
-        if self.peeked.is_none() {
-            self.peeked = self.inner.next();
-        }
-        self.peeked.as_ref()
-    }
-
-    fn next(&mut self) -> Option<u64> {
-        self.peek();
-        let item = self.peeked.take()?;
-        let mut locked = self.progress.lock().unwrap();
-        locked.index += 1;
-        Some(item)
-    }
-}
-
-impl<'io, IO: Io> ProgressTracker<IO> for DefaultTracker<'io, IO> {
-    fn io(&self) -> &IO {
-        self.io
-    }
-
-    fn fetch<I>(&self, items: I) -> impl PeekableIter<u64>
-    where
-        I: Iterator<Item = u64>,
-    {
-        {
-            let mut locked = self.progress.lock().unwrap();
-            locked.length = items.size_hint().0;
-        }
-        DefaultFetchIterator {
-            inner: items,
-            progress: self.progress.clone(),
-            peeked: None,
-        }
-    }
-
-    fn scan<I>(&self, items: I) -> impl Iterator<Item = IndexedNoteEntry> + Send
-    where
-        I: IntoIterator<Item = IndexedNoteEntry>,
-    {
-        let items: Vec<_> = items.into_iter().collect();
-        items.into_iter()
-    }
-
-    fn left_to_fetch(&self) -> usize {
-        let locked = self.progress.lock().unwrap();
-        locked.length - locked.index
-    }
 }
 
 #[cfg(test)]

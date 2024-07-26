@@ -4107,6 +4107,7 @@ dependencies = [
  "sha2 0.9.9",
  "slip10_ed25519",
  "smooth-operator",
+ "tempfile",
  "tendermint-rpc",
  "thiserror",
  "tiny-bip39",

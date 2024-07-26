@@ -72,12 +72,13 @@ use thiserror::Error;
 
 use crate::error::{Error, QueryError};
 use crate::io::Io;
+use crate::masp::shielded_sync::dispatcher::DispatcherCache;
 use crate::masp::shielded_sync::utils::MaspClient;
+#[cfg(not(target_family = "wasm"))]
+pub use crate::masp::shielded_sync::MaspLocalTaskEnv;
 pub use crate::masp::shielded_sync::{
     utils, ShieldedSyncConfig, ShieldedSyncConfigBuilder,
 };
-#[cfg(not(target_family = "wasm"))]
-pub use crate::masp::shielded_sync::MaspLocalTaskEnv;
 use crate::queries::Client;
 use crate::rpc::{query_conversion, query_denom};
 use crate::task_env::TaskEnvironment;
@@ -238,6 +239,21 @@ pub trait ShieldedUtils:
         &self,
         ctx: &ShieldedContext<U>,
     ) -> std::io::Result<()>;
+
+    /// Save a cache of data as part of shielded sync if that
+    /// process gets interrupted.
+    async fn cache_save(
+        &self,
+        _cache: &DispatcherCache,
+    ) -> std::io::Result<()> {
+        unimplemented!()
+    }
+
+    /// Load a cache of data as part of shielded sync if that
+    /// process gets interrupted.
+    async fn cache_load(&self) -> std::io::Result<DispatcherCache> {
+        unimplemented!()
+    }
 }
 
 /// Make a ViewingKey that can view notes encrypted by given ExtendedSpendingKey
@@ -558,231 +574,6 @@ impl<U: ShieldedUtils + MaybeSend + MaybeSync> ShieldedContext<U> {
         )
         .map(|ix| ix.height);
         Ok(last_height_in_witnesses.unwrap_or_else(BlockHeight::first))
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    #[cfg(FALSE)]
-    async fn update_with_pre_built_data<M>(
-        &mut self,
-        client: &M,
-        height: BlockHeight,
-    ) -> Result<(), Error>
-    where
-        M: MaspClient,
-    {
-        let tree_fut = async {
-            if client.capabilities().may_fetch_pre_built_tree() {
-                client.fetch_commitment_tree(height).await.map(Some)
-            } else {
-                Ok(None)
-            }
-        };
-        let notes_map_fut = async {
-            if client.capabilities().may_fetch_pre_built_notes_map() {
-                client.fetch_tx_notes_map(height).await.map(Some)
-            } else {
-                Ok(None)
-            }
-        };
-        let witness_map_fut = async {
-            if client.capabilities().may_fetch_pre_built_witness_map() {
-                client.fetch_witness_map(height).await.map(Some)
-            } else {
-                Ok(None)
-            }
-        };
-
-        let (maybe_tree, maybe_notes_map, maybe_witness_map) =
-            futures::try_join!(tree_fut, notes_map_fut, witness_map_fut)?;
-
-        if let Some(tree) = maybe_tree {
-            self.tree = tree;
-        }
-        if let Some(notes_map) = maybe_notes_map {
-            self.tx_note_map = notes_map;
-        }
-        if let Some(witness_map) = maybe_witness_map {
-            self.witness_map = witness_map;
-        }
-
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[cfg(not(target_family = "wasm"))]
-    #[cfg(FALSE)]
-    async fn fetch_aux<IO, M>(
-        &mut self,
-        client: M,
-        progress: &impl ProgressTracker<IO>,
-        start_query_height: Option<BlockHeight>,
-        last_query_height: Option<BlockHeight>,
-        retry: RetryStrategy,
-        sks: &[ExtendedSpendingKey],
-        fvks: &[ViewingKey],
-        mut shutdown_signal: crate::control_flow::ShutdownSignal,
-    ) -> Result<(), Error>
-    where
-        IO: Io,
-        M: MaspClient,
-    {
-        if start_query_height > last_query_height {
-            return Err(Error::Other(format!(
-                "The start height {start_query_height:?} cannot be higher \
-                 than the ending height {last_query_height:?} in the shielded \
-                 sync"
-            )));
-        }
-
-        // add new viewing keys
-        // Reload the state from file to get the last confirmed state and
-        // discard any speculative data, we cannot fetch on top of a
-        // speculative state
-        // Always reload the confirmed context or initialize a new one if not
-        // found
-        if self.load_confirmed().await.is_err() {
-            // Initialize a default context if we couldn't load a valid one
-            // from storage
-            *self = Self {
-                utils: std::mem::take(&mut self.utils),
-                ..Default::default()
-            };
-        }
-        for esk in sks {
-            let vk = to_viewing_key(esk).vk;
-            self.vk_heights.entry(vk).or_default();
-        }
-        for vk in fvks {
-            self.vk_heights.entry(*vk).or_default();
-        }
-
-        // Save the context to persist newly added keys
-        let _ = self.save().await;
-
-        // the latest block height which has been added to the witness Merkle
-        // tree
-        let last_witnessed_tx = self.tx_note_map.keys().max().cloned();
-
-        // Query for the last produced block height
-        let Some(last_block_height) = client.last_block_height().await? else {
-            return Err(Error::Other(
-                "No block has been committed yet".to_string(),
-            ));
-        };
-
-        let last_query_height = last_query_height
-            .unwrap_or(last_block_height)
-            // NB: limit fetching until the last committed height
-            .min(last_block_height);
-
-        let mut start_height = start_query_height
-            .map_or_else(|| self.min_height_to_sync_from(), Ok)?
-            // NB: the start height cannot be greater than
-            // `last_query_height`
-            .min(last_query_height);
-
-        self.update_with_pre_built_data(&client, last_query_height)
-            .await?;
-
-        for _ in retry {
-            debug_assert!(start_height <= last_query_height);
-
-            // a stateful channel that communicates notes fetched to the trial
-            // decryption process
-            let (fetch_send, fetch_recv) = fetch_channel::new(
-                self.unscanned.clone(),
-                client.capabilities().needs_witness_map_update(),
-            );
-            let fetch_res = self
-                .fetch_shielded_transfers(
-                    &client,
-                    progress,
-                    &mut shutdown_signal,
-                    fetch_send,
-                    start_height,
-                    last_query_height,
-                )
-                .await;
-            // if fetching errored, log it. But this is recoverable.
-            match fetch_res {
-                Err(e @ Error::Interrupt(_)) => {
-                    display_line!(progress.io(), "{}", e.to_string(),);
-                    return Err(e);
-                }
-                Err(e) => display_line!(
-                    progress.io(),
-                    "Error encountered while fetching: {}",
-                    e.to_string(),
-                ),
-                _ => {}
-            }
-            let txs = progress.scan(fetch_recv);
-            for (ref indexed_tx, ref stx) in txs {
-                if client.capabilities().needs_witness_map_update()
-                    && Some(indexed_tx) > last_witnessed_tx.as_ref()
-                {
-                    self.update_witness_map(indexed_tx.to_owned(), stx)?;
-                }
-                let mut vk_heights = BTreeMap::new();
-                std::mem::swap(&mut vk_heights, &mut self.vk_heights);
-                for (vk, h) in vk_heights
-                    .iter_mut()
-                    .filter(|(_vk, h)| h.as_ref() < Some(indexed_tx))
-                {
-                    self.scan_tx(indexed_tx.to_owned(), stx, vk)?;
-                    *h = Some(indexed_tx.to_owned());
-                }
-                // possibly remove unneeded elements from the cache.
-                self.unscanned.scanned(indexed_tx);
-                std::mem::swap(&mut vk_heights, &mut self.vk_heights);
-                if shutdown_signal.received() {
-                    let _ = self.save().await;
-                    return Err(Error::Interrupt(
-                        "[ShieldedSync::Scanning]".to_string(),
-                    ));
-                }
-            }
-
-            // If fetching failed before completing, we restart
-            // the process from the height we managed to sync to.
-            // Otherwise, we can break the loop.
-            if progress.left_to_fetch() == 0 {
-                break;
-            }
-
-            start_height = self.min_height_to_sync_from()?.clamp(
-                start_query_height.unwrap_or_else(BlockHeight::first),
-                last_query_height,
-            );
-        }
-        _ = self.save().await;
-
-        if progress.left_to_fetch() != 0 {
-            Err(Error::Other(
-                "After retrying, could not fetch all MASP txs.".to_string(),
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Obtain a chronologically-ordered list of all accepted shielded
-    /// transactions from a node.
-    #[cfg(FALSE)]
-    async fn fetch_shielded_transfers<IO: Io, M: MaspClient>(
-        &self,
-        client: &M,
-        last_indexed_tx: BlockHeight,
-        last_query_height: BlockHeight,
-    ) -> Result<(), Error> {
-        // Fetch all the transactions we do not have yet
-        let first_height_to_query = last_indexed_tx;
-        let res = client
-            .fetch_shielded_transfers(first_height_to_query, last_query_height)
-            .await;
-        // persist fetched notes
-        _ = self.save().await;
-        res
     }
 
     #[allow(missing_docs)]
@@ -3374,9 +3165,11 @@ pub mod fs {
 
     /// Shielded context file name
     const FILE_NAME: &str = "shielded.dat";
-    const TMP_FILE_NAME: &str = "shielded.tmp";
+    const TMP_FILE_PREFIX: &str = "shielded.tmp";
     const SPECULATIVE_FILE_NAME: &str = "speculative_shielded.dat";
-    const SPECULATIVE_TMP_FILE_NAME: &str = "speculative_shielded.tmp";
+    const SPECULATIVE_TMP_FILE_PREFIX: &str = "speculative_shielded.tmp";
+    const CACHE_FILE_NAME: &str = "shielded_sync.cache";
+    const CACHE_FILE_TMP_PREFIX: &str = "shielded_sync.cache.tmp";
 
     #[derive(Debug, BorshSerialize, BorshDeserialize, Clone)]
     /// An implementation of ShieldedUtils for standard filesystems
@@ -3431,6 +3224,50 @@ pub mod fs {
                 sync_status,
                 ..Default::default()
             }
+        }
+
+        /// Write to a file ensuring that all contents of the file
+        /// were written by a single process (in case of multiple
+        /// concurrent write attempts).
+        ///
+        /// N.B. This is not the same as a file lock. If multiple
+        /// concurrent writes take place, this code ensures that
+        /// the result of exactly one will be persisted.
+        ///
+        /// N.B. This only truly works if each process uses
+        /// to a *unique* tmp file name.
+        fn atomic_file_write(
+            &self,
+            tmp_file_name: impl AsRef<std::path::Path>,
+            file_name: impl AsRef<std::path::Path>,
+            data: impl BorshSerialize,
+        ) -> std::io::Result<()> {
+            let tmp_path = self.context_dir.join(&tmp_file_name);
+            {
+                // First serialize the shielded context into a temporary file.
+                // Inability to create this file implies a simultaneuous write
+                // is in progress. In this case, immediately
+                // fail. This is unproblematic because the data
+                // intended to be stored can always be re-fetched
+                // from the blockchain.
+                let mut ctx_file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(tmp_path.clone())?;
+                let mut bytes = Vec::new();
+                data.serialize(&mut bytes).unwrap_or_else(|e| {
+                    panic!(
+                        "cannot serialize data to {} with error: {}",
+                        file_name.as_ref().to_string_lossy(),
+                        e,
+                    )
+                });
+                ctx_file.write_all(&bytes[..])?;
+            }
+            // Atomically update the old shielded context file with new data.
+            // Atomicity is required to prevent other client instances from
+            // reading corrupt data.
+            std::fs::rename(tmp_path, self.context_dir.join(file_name))
         }
     }
 
@@ -3491,34 +3328,19 @@ pub mod fs {
             &self,
             ctx: &ShieldedContext<U>,
         ) -> std::io::Result<()> {
-            // TODO: use mktemp crate?
-            let (tmp_file_name, file_name) = match ctx.sync_status {
-                ContextSyncStatus::Confirmed => (TMP_FILE_NAME, FILE_NAME),
+            let (tmp_file_pref, file_name) = match ctx.sync_status {
+                ContextSyncStatus::Confirmed => (TMP_FILE_PREFIX, FILE_NAME),
                 ContextSyncStatus::Speculative => {
-                    (SPECULATIVE_TMP_FILE_NAME, SPECULATIVE_FILE_NAME)
+                    (SPECULATIVE_TMP_FILE_PREFIX, SPECULATIVE_FILE_NAME)
                 }
             };
-            let tmp_path = self.context_dir.join(tmp_file_name);
-            {
-                // First serialize the shielded context into a temporary file.
-                // Inability to create this file implies a simultaneuous write
-                // is in progress. In this case, immediately
-                // fail. This is unproblematic because the data
-                // intended to be stored can always be re-fetched
-                // from the blockchain.
-                let mut ctx_file = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(tmp_path.clone())?;
-                let mut bytes = Vec::new();
-                ctx.serialize(&mut bytes)
-                    .expect("cannot serialize shielded context");
-                ctx_file.write_all(&bytes[..])?;
-            }
-            // Atomically update the old shielded context file with new data.
-            // Atomicity is required to prevent other client instances from
-            // reading corrupt data.
-            std::fs::rename(tmp_path, self.context_dir.join(file_name))?;
+            let tmp_file_name = {
+                let t = tempfile::Builder::new()
+                    .prefix(tmp_file_pref)
+                    .tempfile()?;
+                t.path().file_name().unwrap().to_owned()
+            };
+            self.atomic_file_write(tmp_file_name, file_name, ctx)?;
 
             // Remove the speculative file if present since it's state is
             // overruled by the confirmed one we just saved
@@ -3530,436 +3352,25 @@ pub mod fs {
 
             Ok(())
         }
-    }
-}
 
-#[cfg(test)]
-#[cfg(FALSE)] // TODO: fix tests
-mod test_shielded_sync {
-    use core::str::FromStr;
-    use std::collections::BTreeSet;
+        async fn cache_save(
+            &self,
+            cache: &DispatcherCache,
+        ) -> std::io::Result<()> {
+            let tmp_file_name = {
+                let t = tempfile::Builder::new()
+                    .prefix(CACHE_FILE_TMP_PREFIX)
+                    .tempfile()?;
+                t.path().file_name().unwrap().to_owned()
+            };
 
-    use masp_primitives::zip32::ExtendedFullViewingKey;
-    use namada_core::masp::ExtendedViewingKey;
-    use namada_core::storage::{BlockHeight, TxIndex};
-    use namada_tx::IndexedTx;
-    use tempfile::tempdir;
-
-    use crate::control_flow::testing_shutdown_signal;
-    use crate::error::Error;
-    use crate::io::StdIo;
-    use crate::masp::fs::FsShieldedUtils;
-    use crate::masp::test_utils::{
-        arbitrary_masp_tx, test_client, TestUnscannedTracker,
-        TestingMaspClient, AA_VIEWING_KEY,
-    };
-    use crate::masp::utils::{DefaultTracker, ProgressTracker, RetryStrategy};
-
-    /// Test that if fetching fails before finishing,
-    /// we re-establish the fetching process
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_retry_fetch() {
-        let temp_dir = tempdir().unwrap();
-        let mut shielded_ctx =
-            FsShieldedUtils::new(temp_dir.path().to_path_buf());
-        let (client, masp_tx_sender) = test_client(2.into());
-        let io = StdIo;
-        let progress = DefaultTracker::new(&io);
-        let vk = ExtendedFullViewingKey::from(
-            ExtendedViewingKey::from_str(AA_VIEWING_KEY).expect("Test failed"),
-        )
-        .fvk
-        .vk;
-        masp_tx_sender.send(None).expect("Test failed");
-
-        // we first test that with no retries, a fetching failure
-        // stops process
-        let result = shielded_ctx
-            .fetch(
-                TestingMaspClient::new(&client),
-                &progress,
-                None,
-                None,
-                RetryStrategy::Times(1),
-                &[],
-                &[vk],
-            )
-            .await
-            .unwrap_err();
-        match result {
-            Error::Other(msg) => assert_eq!(
-                msg.as_str(),
-                "After retrying, could not fetch all MASP txs."
-            ),
-            other => panic!("{:?} does not match Error::Other(_)", other),
+            self.atomic_file_write(tmp_file_name, CACHE_FILE_NAME, cache)
         }
 
-        // We now have a fetch failure followed by two successful
-        // masp txs from the same block.
-        let masp_tx = arbitrary_masp_tx();
-        masp_tx_sender.send(None).expect("Test failed");
-        masp_tx_sender
-            .send(Some((
-                IndexedTx {
-                    height: 1.into(),
-                    index: TxIndex(1),
-                },
-                vec![masp_tx.clone()],
-            )))
-            .expect("Test failed");
-        masp_tx_sender
-            .send(Some((
-                IndexedTx {
-                    height: 1.into(),
-                    index: TxIndex(2),
-                },
-                vec![masp_tx.clone()],
-            )))
-            .expect("Test failed");
-
-        // This should complete successfully
-        shielded_ctx
-            .fetch(
-                TestingMaspClient::new(&client),
-                &progress,
-                None,
-                None,
-                RetryStrategy::Times(2),
-                &[],
-                &[vk],
-            )
-            .await
-            .expect("Test failed");
-
-        shielded_ctx.load_confirmed().await.expect("Test failed");
-        let keys = shielded_ctx
-            .tx_note_map
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let expected = BTreeSet::from([
-            IndexedTx {
-                height: 1.into(),
-                index: TxIndex(1),
-            },
-            IndexedTx {
-                height: 1.into(),
-                index: TxIndex(2),
-            },
-        ]);
-
-        assert_eq!(keys, expected);
-        assert_eq!(
-            *shielded_ctx.vk_heights[&vk].as_ref().unwrap(),
-            IndexedTx {
-                height: 1.into(),
-                index: TxIndex(2),
-            }
-        );
-        assert_eq!(shielded_ctx.note_map.len(), 2);
-    }
-
-    /// Test that upon each retry, we either resume from the
-    /// latest height that had been previously stored in the
-    /// `tx_note_map`, or from the minimum height stored in
-    /// `vk_heights`.
-    #[test]
-    fn test_min_height_to_sync_from() {
-        let temp_dir = tempdir().unwrap();
-        let mut shielded_ctx =
-            FsShieldedUtils::new(temp_dir.path().to_path_buf());
-
-        let vk = ExtendedFullViewingKey::from(
-            ExtendedViewingKey::from_str(AA_VIEWING_KEY).expect("Test failed"),
-        )
-        .fvk
-        .vk;
-
-        // pretend we start with a tx observed at height 4 whose
-        // notes cannot be decrypted with `vk`
-        shielded_ctx.tx_note_map.insert(
-            IndexedTx {
-                height: 4.into(),
-                index: TxIndex(0),
-            },
-            0,
-        );
-
-        // the min height here should be 1, since
-        // this vk hasn't decrypted any note yet
-        shielded_ctx.vk_heights.insert(vk, None);
-
-        let height = shielded_ctx.min_height_to_sync_from().unwrap();
-        assert_eq!(height, BlockHeight(1));
-
-        // let's bump the vk height past 4
-        *shielded_ctx.vk_heights.get_mut(&vk).unwrap() = Some(IndexedTx {
-            height: 6.into(),
-            index: TxIndex(0),
-        });
-
-        // the min height should now be 4
-        let height = shielded_ctx.min_height_to_sync_from().unwrap();
-        assert_eq!(height, BlockHeight(4));
-
-        // and now we bump the last seen tx to height 8
-        shielded_ctx.tx_note_map.insert(
-            IndexedTx {
-                height: 8.into(),
-                index: TxIndex(0),
-            },
-            1,
-        );
-
-        // the min height should now be 6
-        let height = shielded_ctx.min_height_to_sync_from().unwrap();
-        assert_eq!(height, BlockHeight(6));
-    }
-
-    /// Test that the progress tracker correctly keeps
-    /// track of how many blocks there are left to fetch
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_left_to_fetch() {
-        let temp_dir = tempdir().unwrap();
-        let mut shielded_ctx =
-            FsShieldedUtils::new(temp_dir.path().to_path_buf());
-        let (client, masp_tx_sender) = test_client(2.into());
-        let io = StdIo;
-        let progress = DefaultTracker::new(&io);
-        let vk = ExtendedFullViewingKey::from(
-            ExtendedViewingKey::from_str(AA_VIEWING_KEY).expect("Test failed"),
-        )
-        .fvk
-        .vk;
-        let masp_tx = arbitrary_masp_tx();
-
-        // first fetch no blocks
-        masp_tx_sender.send(None).expect("Test failed");
-        shielded_ctx
-            .fetch(
-                TestingMaspClient::new(&client),
-                &progress,
-                None,
-                None,
-                RetryStrategy::Times(1),
-                &[],
-                &[vk],
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(progress.left_to_fetch(), 2);
-
-        // fetch one of the two blocks
-        masp_tx_sender
-            .send(Some((
-                IndexedTx {
-                    height: 1.into(),
-                    index: Default::default(),
-                },
-                vec![masp_tx.clone()],
-            )))
-            .expect("Test failed");
-        masp_tx_sender.send(None).expect("Test failed");
-        shielded_ctx
-            .fetch(
-                TestingMaspClient::new(&client),
-                &progress,
-                None,
-                None,
-                RetryStrategy::Times(1),
-                &[],
-                &[vk],
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(progress.left_to_fetch(), 1);
-
-        // fetch no blocks
-        masp_tx_sender.send(None).expect("Test failed");
-        shielded_ctx
-            .fetch(
-                TestingMaspClient::new(&client),
-                &progress,
-                None,
-                None,
-                RetryStrategy::Times(1),
-                &[],
-                &[vk],
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(progress.left_to_fetch(), 1);
-
-        // fetch no blocks, but increase the latest block height
-        // thus the amount left to fetch should increase
-        let (client, masp_tx_sender) = test_client(3.into());
-        masp_tx_sender.send(None).expect("Test failed");
-        shielded_ctx
-            .fetch(
-                TestingMaspClient::new(&client),
-                &progress,
-                None,
-                None,
-                RetryStrategy::Times(1),
-                &[],
-                &[vk],
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(progress.left_to_fetch(), 2);
-
-        // fetch remaining block
-        masp_tx_sender
-            .send(Some((
-                IndexedTx {
-                    height: 2.into(),
-                    index: Default::default(),
-                },
-                vec![masp_tx.clone()],
-            )))
-            .expect("Test failed");
-        masp_tx_sender
-            .send(Some((
-                IndexedTx {
-                    height: 3.into(),
-                    index: Default::default(),
-                },
-                vec![masp_tx.clone()],
-            )))
-            .expect("Test failed");
-        // this should not produce an error since we have fetched
-        // all expected blocks
-        masp_tx_sender.send(None).expect("Test failed");
-        shielded_ctx
-            .fetch(
-                TestingMaspClient::new(&client),
-                &progress,
-                None,
-                None,
-                RetryStrategy::Times(1),
-                &[],
-                &[vk],
-            )
-            .await
-            .expect("Test failed");
-        assert_eq!(progress.left_to_fetch(), 0);
-    }
-
-    /// Test that if we don't scan all fetched notes, they
-    /// are persisted in a cache
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_unscanned_cache() {
-        let (client, masp_tx_sender) = test_client(2.into());
-        let temp_dir = tempdir().unwrap();
-        let mut shielded_ctx =
-            FsShieldedUtils::new(temp_dir.path().to_path_buf());
-
-        let io = StdIo;
-        let progress = TestUnscannedTracker::new(&io);
-        let vk = ExtendedFullViewingKey::from(
-            ExtendedViewingKey::from_str(AA_VIEWING_KEY).expect("Test failed"),
-        )
-        .fvk
-        .vk;
-
-        // the fetched txs
-        let masp_tx = arbitrary_masp_tx();
-        masp_tx_sender
-            .send(Some((
-                IndexedTx {
-                    height: 1.into(),
-                    index: TxIndex(1),
-                },
-                vec![masp_tx.clone()],
-            )))
-            .expect("Test failed");
-        masp_tx_sender
-            .send(Some((
-                IndexedTx {
-                    height: 1.into(),
-                    index: TxIndex(2),
-                },
-                vec![masp_tx.clone()],
-            )))
-            .expect("Test failed");
-
-        shielded_ctx
-            .fetch(
-                TestingMaspClient::new(&client),
-                &progress,
-                None,
-                None,
-                RetryStrategy::Times(2),
-                &[],
-                &[vk],
-            )
-            .await
-            .expect("Test failed");
-
-        shielded_ctx.load_confirmed().await.expect("Test failed");
-        let keys = shielded_ctx
-            .unscanned
-            .txs
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        let expected = vec![IndexedTx {
-            height: 1.into(),
-            index: TxIndex(2),
-        }];
-        assert_eq!(keys, expected);
-    }
-
-    /// Test that if fetching gets interrupted,
-    /// we persist the fetched notes in a cache
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_fetching_interrupt() {
-        let temp_dir = tempdir().unwrap();
-        let mut shielded_ctx =
-            FsShieldedUtils::new(temp_dir.path().to_path_buf());
-        let (client, masp_tx_sender) = test_client(2.into());
-        let io = StdIo;
-        let progress = DefaultTracker::new(&io);
-        let vk = ExtendedFullViewingKey::from(
-            ExtendedViewingKey::from_str(AA_VIEWING_KEY).expect("Test failed"),
-        )
-        .fvk
-        .vk;
-        let (shutdown_send, shutdown_signal) = testing_shutdown_signal();
-        // the fetched txs
-        let masp_tx = arbitrary_masp_tx();
-        // mock that we have already fetched a note
-        let expected = (
-            IndexedTx {
-                height: 1.into(),
-                index: TxIndex(1),
-            },
-            vec![masp_tx],
-        );
-        masp_tx_sender
-            .send(Some(expected.clone()))
-            .expect("Test failed");
-        shutdown_send.send(()).expect("Test failed");
-        let Error::Interrupt(ref proc) = shielded_ctx
-            .fetch_aux(
-                TestingMaspClient::new(&client),
-                &progress,
-                None,
-                None,
-                RetryStrategy::Forever,
-                &[],
-                &[vk],
-                shutdown_signal,
-            )
-            .await
-            .expect_err("Test failed")
-        else {
-            panic!("Test failed")
-        };
-        assert_eq!(proc, "[Testing::Fetch]");
-        shielded_ctx.load_confirmed().await.expect("Test failed");
-        let entry = shielded_ctx.unscanned.pop_first().expect("Test failed");
-        assert_eq!(entry, expected);
-        assert!(shielded_ctx.unscanned.is_empty());
+        async fn cache_load(&self) -> std::io::Result<DispatcherCache> {
+            let file_name = self.context_dir.join(CACHE_FILE_NAME);
+            let mut file = File::open(file_name)?;
+            DispatcherCache::try_from_reader(&mut file)
+        }
     }
 }

@@ -138,6 +138,7 @@ zeroize.workspace = true
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 rayon.workspace = true
 reqwest.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["full"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]

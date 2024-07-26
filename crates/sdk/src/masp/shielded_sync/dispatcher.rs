@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::atomic::{self, AtomicBool, AtomicUsize};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use futures::future::{select, Either};
 use futures::task::AtomicWaker;
 use masp_primitives::merkle_tree::{CommitmentTree, IncrementalWitness};
@@ -157,7 +159,7 @@ enum Message {
         >,
     ),
     FetchTxs(Result<Vec<IndexedNoteEntry>, TaskError<[BlockHeight; 2]>>),
-    TrialDecrypt(IndexedTx, ViewingKey, Vec<DecryptedData>),
+    TrialDecrypt(IndexedTx, ViewingKey, ControlFlow<(), Vec<DecryptedData>>),
 }
 
 struct DispatcherTasks<Spawner> {
@@ -184,13 +186,13 @@ impl<Spawner> DispatcherTasks<Spawner> {
     }
 }
 
-#[derive(Default)]
-struct DispatcherCache {
-    pub commitment_tree: Option<(BlockHeight, CommitmentTree<Node>)>,
-    pub witness_map: Option<(BlockHeight, WitnessMap)>,
-    pub tx_note_map: Option<(BlockHeight, TxNoteMap)>,
-    pub fetched: Fetched,
-    pub trial_decrypted: TrialDecrypted,
+#[derive(Default, BorshSerialize, BorshDeserialize)]
+pub struct DispatcherCache {
+    pub(crate) commitment_tree: Option<(BlockHeight, CommitmentTree<Node>)>,
+    pub(crate) witness_map: Option<(BlockHeight, WitnessMap)>,
+    pub(crate) tx_note_map: Option<(BlockHeight, TxNoteMap)>,
+    pub(crate) fetched: Fetched,
+    pub(crate) trial_decrypted: TrialDecrypted,
 }
 
 #[derive(Debug)]
@@ -273,8 +275,7 @@ where
         panic_flag: PanicFlag::default(),
     };
 
-    // TODO: load cache from file
-    let cache = DispatcherCache::default();
+    let cache = ctx.utils.cache_load().await.unwrap_or_default();
 
     Dispatcher {
         height_to_sync: BlockHeight(0),
@@ -312,33 +313,39 @@ where
                 fvks,
             )
             .await?;
-
+        self.check_exit_conditions(&mut shutdown_signal);
         while let Some(message) = self.tasks.get_next_message().await {
             self.check_exit_conditions(&mut shutdown_signal);
             self.handle_incoming_message(message);
         }
 
-        match self.state {
+        match std::mem::replace(&mut self.state, DispatcherState::Normal) {
             DispatcherState::Errored(err) => {
-                // TODO: save cache to file
+                self.save_cache().await;
                 Err(err)
             }
             DispatcherState::Interrupted => {
-                // TODO: save cache to file
+                self.save_cache().await;
                 Ok(None)
             }
             DispatcherState::Normal => {
-                // TODO: load shielded context at this stage
-
                 self.apply_cache_to_shielded_context(&initial_state)?;
                 self.ctx.save().await.map_err(|err| {
                     Error::Other(format!(
                         "Failed to save the shielded context: {err}"
                     ))
                 })?;
-
+                self.save_cache().await;
                 Ok(Some(self.ctx))
             }
+        }
+    }
+
+    async fn save_cache(&self) {
+        if let Err(e) = self.ctx.utils.cache_save(&self.cache).await {
+            tracing::error!(
+                "Failed to save shielded sync cache with error {e}"
+            );
         }
     }
 
@@ -486,7 +493,7 @@ where
             ..=initial_state.last_query_height.0)
             .step_by(batch_size)
         {
-            let to = (from + batch_size as u64)
+            let to = (from + batch_size as u64 - 1)
                 .min(initial_state.last_query_height.0);
             self.spawn_fetch_txs(BlockHeight(from), BlockHeight(to));
         }
@@ -549,7 +556,9 @@ where
                 }
             }
             Message::TrialDecrypt(itx, vk, decrypted_data) => {
-                self.cache.trial_decrypted.insert(itx, vk, decrypted_data);
+                if let ControlFlow::Continue(decrypted_data) = decrypted_data {
+                    self.cache.trial_decrypted.insert(itx, vk, decrypted_data);
+                }
             }
         }
     }
@@ -651,7 +660,7 @@ where
                         Message::TrialDecrypt(
                             itx,
                             vk,
-                            trial_decrypt(tx, vk, interrupt),
+                            trial_decrypt(tx, vk, || interrupt.get()),
                         )
                     })
                 }
@@ -711,43 +720,45 @@ fn pre_built_in_cache<T>(
 
 #[cfg(test)]
 mod dispatcher_tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::hint::spin_loop;
+
     use futures::join;
-    use tempfile::tempdir;
-    use namada_core::storage::BlockHeight;
+    use namada_core::storage::{BlockHeight, TxIndex};
     use namada_tx::IndexedTx;
+    use tempfile::tempdir;
 
     use super::*;
     use crate::control_flow::testing_shutdown_signal;
     use crate::masp::fs::FsShieldedUtils;
+    use crate::masp::test_utils::{
+        arbitrary_masp_tx, arbitrary_masp_tx_with_fee_unshielding,
+        arbitrary_vk, TestingMaspClient,
+    };
     use crate::masp::{MaspLocalTaskEnv, ShieldedSyncConfig};
-    use crate::masp::test_utils::{arbitrary_vk, TestingMaspClient};
     use crate::task_env::TaskEnvironment;
 
     #[tokio::test]
     async fn test_applying_cache_drains_decrypted_data() {
-        let client = TestingMaspClient::new(BlockHeight::first());
+        let (client, _) = TestingMaspClient::new(BlockHeight::first());
         let config = ShieldedSyncConfig::builder().client(client).build();
         let temp_dir = tempdir().unwrap();
         let utils = FsShieldedUtils {
-            context_dir:  temp_dir.path().to_path_buf(),
+            context_dir: temp_dir.path().to_path_buf(),
         };
         MaspLocalTaskEnv::new(4)
             .expect("Test failed")
             .run(|s| async {
                 let mut dispatcher = config.dispatcher(s, &utils).await;
-                dispatcher.ctx.vk_heights = BTreeMap::from([(arbitrary_vk(), None)]);
+                dispatcher.ctx.vk_heights =
+                    BTreeMap::from([(arbitrary_vk(), None)]);
                 // fill up the dispatcher's cache
                 for h in 0u64..10 {
                     let itx = IndexedTx {
                         height: h.into(),
                         index: Default::default(),
                     };
-                    dispatcher.cache.fetched.insert((
-                        itx,
-                        vec![],
-                    ));
+                    dispatcher.cache.fetched.insert((itx, vec![]));
                     dispatcher.ctx.tx_note_map.insert(itx, h as usize);
                     dispatcher.cache.trial_decrypted.insert(
                         itx,
@@ -756,17 +767,21 @@ mod dispatcher_tests {
                     )
                 }
 
-                dispatcher.apply_cache_to_shielded_context(
-                    &Default::default()
-                ).expect("Test failed");
+                dispatcher
+                    .apply_cache_to_shielded_context(&Default::default())
+                    .expect("Test failed");
                 assert!(dispatcher.cache.fetched.is_empty());
                 assert!(dispatcher.cache.trial_decrypted.is_empty());
                 let expected = BTreeMap::from([(
                     arbitrary_vk(),
-                    Some(IndexedTx{ height: 9.into(), index: Default::default() })
+                    Some(IndexedTx {
+                        height: 9.into(),
+                        index: Default::default(),
+                    }),
                 )]);
                 assert_eq!(expected, dispatcher.ctx.vk_heights);
-            }).await;
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -827,11 +842,11 @@ mod dispatcher_tests {
     }
 
     async fn test_panic_flag_aux(sync: bool) {
-        let client = TestingMaspClient::new(BlockHeight::first());
+        let (client, _) = TestingMaspClient::new(BlockHeight::first());
         let config = ShieldedSyncConfig::builder().client(client).build();
         let temp_dir = tempdir().unwrap();
         let utils = FsShieldedUtils {
-            context_dir:  temp_dir.path().to_path_buf(),
+            context_dir: temp_dir.path().to_path_buf(),
         };
         _ = MaspLocalTaskEnv::new(4)
             .expect("Test failed")
@@ -839,7 +854,7 @@ mod dispatcher_tests {
                 let dispatcher = config.dispatcher(s, &utils).await;
 
                 let barrier = Arc::new(tokio::sync::Barrier::new(11));
-                for _ in 0 .. 10 {
+                for _ in 0..10 {
                     let barrier = barrier.clone();
                     dispatcher.spawn_async(Box::pin(async move {
                         barrier.wait().await;
@@ -852,17 +867,25 @@ mod dispatcher_tests {
                 assert!(!dispatcher.tasks.panic_flag.panicked());
                 // panic a thread
                 if sync {
-                    dispatcher.spawn_sync(|_| { panic!("OH NOES!")});
+                    dispatcher.spawn_sync(|_| panic!("OH NOES!"));
                 } else {
-                    dispatcher.spawn_async(Box::pin(async { panic!("OH NOES!") }));
+                    dispatcher
+                        .spawn_async(Box::pin(async { panic!("OH NOES!") }));
                 }
 
                 // run the dispatcher
                 let (_sender, shutdown_signal) = testing_shutdown_signal();
                 let flag = dispatcher.tasks.panic_flag.clone();
-                let dispatcher_fut = dispatcher.run(shutdown_signal, Some(BlockHeight::first()), Some(BlockHeight(10)), &[], &[]);
+                let dispatcher_fut = dispatcher.run(
+                    shutdown_signal,
+                    Some(BlockHeight::first()),
+                    Some(BlockHeight(10)),
+                    &[],
+                    &[],
+                );
 
-                // we poll the dispatcher future until the panic thread has panicked.
+                // we poll the dispatcher future until the panic thread has
+                // panicked.
                 let wanker = Arc::new(AtomicWaker::new());
                 let _ = {
                     let flag = flag.clone();
@@ -886,7 +909,9 @@ mod dispatcher_tests {
                 // we assert that the panic thread panicked and retrieve the
                 // dispatcher future
                 let Either::Right((_, fut)) =
-                    select(Box::pin(dispatcher_fut), Box::pin(panicked_fut)).await else {
+                    select(Box::pin(dispatcher_fut), Box::pin(panicked_fut))
+                        .await
+                else {
                     panic!("Test failed")
                 };
 
@@ -903,6 +928,308 @@ mod dispatcher_tests {
                     msg,
                     "A worker thread panicked during the shielded sync",
                 );
-            }).await;
+            })
+            .await;
+    }
+
+    /// Test that upon each retry, we either resume from the
+    /// latest height that had been previously stored in the
+    /// `tx_note_map`, or from the minimum height stored in
+    /// `vk_heights`.
+    #[test]
+    fn test_min_height_to_sync_from() {
+        let temp_dir = tempdir().unwrap();
+        let mut shielded_ctx =
+            FsShieldedUtils::new(temp_dir.path().to_path_buf());
+
+        let vk = arbitrary_vk();
+
+        // pretend we start with a tx observed at height 4 whose
+        // notes cannot be decrypted with `vk`
+        shielded_ctx.tx_note_map.insert(
+            IndexedTx {
+                height: 4.into(),
+                index: TxIndex(0),
+            },
+            0,
+        );
+
+        // the min height here should be 1, since
+        // this vk hasn't decrypted any note yet
+        shielded_ctx.vk_heights.insert(vk, None);
+
+        let height = shielded_ctx.min_height_to_sync_from().unwrap();
+        assert_eq!(height, BlockHeight(1));
+
+        // let's bump the vk height past 4
+        *shielded_ctx.vk_heights.get_mut(&vk).unwrap() = Some(IndexedTx {
+            height: 6.into(),
+            index: TxIndex(0),
+        });
+
+        // the min height should now be 4
+        let height = shielded_ctx.min_height_to_sync_from().unwrap();
+        assert_eq!(height, BlockHeight(4));
+
+        // and now we bump the last seen tx to height 8
+        shielded_ctx.tx_note_map.insert(
+            IndexedTx {
+                height: 8.into(),
+                index: TxIndex(0),
+            },
+            1,
+        );
+
+        // the min height should now be 6
+        let height = shielded_ctx.min_height_to_sync_from().unwrap();
+        assert_eq!(height, BlockHeight(6));
+    }
+
+    /// We test that if a masp transaction is only partially trial-decrypted
+    /// before the process is interrupted, we discard the partial results.
+    #[test]
+    fn test_discard_partial_decryption() {
+        let tx = arbitrary_masp_tx_with_fee_unshielding();
+        let vk = arbitrary_vk();
+        let guard = AtomicFlag::default();
+        let interrupt = || {
+            if guard.get() {
+                true
+            } else {
+                guard.set();
+                false
+            }
+        };
+        let res = trial_decrypt(tx, vk, interrupt);
+        assert_eq!(res, ControlFlow::Break(()));
+    }
+
+    /// Test that if fetching fails before finishing,
+    /// we re-establish the fetching process
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_retry_fetch() {
+        let temp_dir = tempdir().unwrap();
+        let utils = FsShieldedUtils {
+            context_dir: temp_dir.path().to_path_buf(),
+        };
+        let (client, masp_tx_sender) = TestingMaspClient::new(2.into());
+        let mut config = ShieldedSyncConfig::builder()
+            .client(client)
+            .retry_strategy(RetryStrategy::Times(0))
+            .build();
+        let vk = arbitrary_vk();
+
+        // we first test that with no retries, a fetching failure
+        // stops process
+        MaspLocalTaskEnv::new(4)
+            .expect("Test failed")
+            .run(|s| async {
+                masp_tx_sender.send(None).expect("Test failed");
+                let dispatcher = config.clone().dispatcher(s, &utils).await;
+
+                let (_send, shutdown_sig) = testing_shutdown_signal();
+                let result =
+                    dispatcher.run(shutdown_sig, None, None, &[], &[vk]).await;
+                match result {
+                    Err(Error::Other(msg)) => assert_eq!(
+                        msg.as_str(),
+                        "After retrying, could not fetch all MASP txs."
+                    ),
+                    other => {
+                        panic!("{:?} does not match Error::Other(_)", other)
+                    }
+                }
+            })
+            .await;
+
+        MaspLocalTaskEnv::new(4)
+            .expect("Test failed")
+            .run(|s| async {
+                // We now have a fetch failure followed by two successful
+                // masp txs from the same block.
+                let masp_tx = arbitrary_masp_tx();
+                masp_tx_sender.send(None).expect("Test failed");
+                masp_tx_sender
+                    .send(Some((
+                        IndexedTx {
+                            height: 1.into(),
+                            index: TxIndex(1),
+                        },
+                        vec![masp_tx.clone()],
+                    )))
+                    .expect("Test failed");
+                masp_tx_sender
+                    .send(Some((
+                        IndexedTx {
+                            height: 1.into(),
+                            index: TxIndex(2),
+                        },
+                        vec![masp_tx.clone()],
+                    )))
+                    .expect("Test failed");
+                config.retry_strategy = RetryStrategy::Times(1);
+                let dispatcher = config.dispatcher(s, &utils).await;
+                let (_send, shutdown_sig) = testing_shutdown_signal();
+                // This should complete successfully
+                let ctx = dispatcher
+                    .run(shutdown_sig, None, None, &[], &[vk])
+                    .await
+                    .expect("Test failed")
+                    .expect("Test failed");
+                let keys =
+                    ctx.tx_note_map.keys().cloned().collect::<BTreeSet<_>>();
+                let expected = BTreeSet::from([
+                    IndexedTx {
+                        height: 1.into(),
+                        index: TxIndex(1),
+                    },
+                    IndexedTx {
+                        height: 1.into(),
+                        index: TxIndex(2),
+                    },
+                ]);
+
+                assert_eq!(keys, expected);
+                assert_eq!(
+                    *ctx.vk_heights[&vk].as_ref().unwrap(),
+                    IndexedTx {
+                        height: 1.into(),
+                        index: TxIndex(2),
+                    }
+                );
+                assert_eq!(ctx.note_map.len(), 2);
+            })
+            .await;
+    }
+
+    /// Test that if we don't scan all fetched notes, they
+    /// are persisted in a cache
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_unscanned_cache() {
+        let temp_dir = tempdir().unwrap();
+        let utils = FsShieldedUtils {
+            context_dir: temp_dir.path().to_path_buf(),
+        };
+        let (client, masp_tx_sender) = TestingMaspClient::new(3.into());
+        let config = ShieldedSyncConfig::builder()
+            .client(client)
+            .retry_strategy(RetryStrategy::Times(0))
+            .block_batch_size(1)
+            .build();
+
+        let vk = arbitrary_vk();
+        MaspLocalTaskEnv::new(4)
+            .expect("Test failed")
+            .run(|s| async {
+                let dispatcher = config.clone().dispatcher(s, &utils).await;
+
+                let masp_tx = arbitrary_masp_tx();
+                masp_tx_sender
+                    .send(Some((
+                        IndexedTx {
+                            height: 1.into(),
+                            index: TxIndex(1),
+                        },
+                        vec![masp_tx.clone()],
+                    )))
+                    .expect("Test failed");
+                masp_tx_sender
+                    .send(Some((
+                        IndexedTx {
+                            height: 1.into(),
+                            index: TxIndex(2),
+                        },
+                        vec![masp_tx.clone()],
+                    )))
+                    .expect("Test failed");
+                masp_tx_sender.send(None).expect("Test failed");
+                let (_send, shutdown_sig) = testing_shutdown_signal();
+                let result =
+                    dispatcher.run(shutdown_sig, None, None, &[], &[vk]).await;
+                match result {
+                    Err(Error::Other(msg)) => assert_eq!(
+                        msg.as_str(),
+                        "After retrying, could not fetch all MASP txs."
+                    ),
+                    other => {
+                        panic!("{:?} does not match Error::Other(_)", other)
+                    }
+                }
+                let cache = utils.cache_load().await.expect("Test failed");
+                let expected = BTreeMap::from([
+                    (
+                        IndexedTx {
+                            height: 1.into(),
+                            index: TxIndex(1),
+                        },
+                        vec![masp_tx.clone()],
+                    ),
+                    (
+                        IndexedTx {
+                            height: 1.into(),
+                            index: TxIndex(2),
+                        },
+                        vec![masp_tx.clone()],
+                    ),
+                ]);
+                assert_eq!(cache.fetched.txs, expected);
+            })
+            .await;
+    }
+
+    /// Test that we can successfully interrupt the dispatcher
+    /// and that it cleans up after itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_interrupt() {
+        let temp_dir = tempdir().unwrap();
+        let utils = FsShieldedUtils {
+            context_dir: temp_dir.path().to_path_buf(),
+        };
+        let (client, masp_tx_sender) = TestingMaspClient::new(2.into());
+        let config = ShieldedSyncConfig::builder()
+            .client(client)
+            .retry_strategy(RetryStrategy::Times(0))
+            .block_batch_size(2)
+            .build();
+
+        MaspLocalTaskEnv::new(4)
+            .expect("Test failed")
+            .run(|s| async {
+                let dispatcher = config.clone().dispatcher(s, &utils).await;
+
+                // we expect a batch of two blocks, but we only send one
+                let masp_tx = arbitrary_masp_tx();
+                masp_tx_sender
+                    .send(Some((
+                        IndexedTx {
+                            height: 1.into(),
+                            index: TxIndex(1),
+                        },
+                        vec![masp_tx.clone()],
+                    )))
+                    .expect("Test failed");
+
+                let (send, shutdown_sig) = testing_shutdown_signal();
+                send.send(()).expect("Test failed");
+                let res = dispatcher
+                    .run(shutdown_sig, None, None, &[], &[arbitrary_vk()])
+                    .await
+                    .expect("Test failed");
+                assert!(res.is_none());
+
+                let DispatcherCache {
+                    commitment_tree,
+                    witness_map,
+                    tx_note_map,
+                    fetched,
+                    trial_decrypted,
+                } = utils.cache_load().await.expect("Test failed");
+                assert!(commitment_tree.is_none());
+                assert!(witness_map.is_none());
+                assert!(tx_note_map.is_none());
+                assert!(fetched.is_empty());
+                assert!(trial_decrypted.is_empty());
+            })
+            .await;
     }
 }

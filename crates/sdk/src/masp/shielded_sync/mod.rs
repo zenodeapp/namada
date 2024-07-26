@@ -1,4 +1,6 @@
 use std::future::Future;
+use std::ops::ControlFlow;
+
 use masp_primitives::sapling::note_encryption::{
     try_sapling_note_decryption, PreparedIncomingViewingKey,
 };
@@ -6,12 +8,15 @@ use masp_primitives::sapling::ViewingKey;
 use masp_primitives::transaction::components::OutputDescription;
 use masp_primitives::transaction::{Authorization, Authorized, Transaction};
 use typed_builder::TypedBuilder;
-use crate::error::Error;
+
 use super::shielded_sync::utils::{MaspClient, RetryStrategy};
-use crate::masp::shielded_sync::dispatcher::{AtomicFlag, Dispatcher};
+use crate::error::Error;
+use crate::masp::shielded_sync::dispatcher::Dispatcher;
 use crate::masp::utils::DecryptedData;
 use crate::masp::{ShieldedUtils, NETWORK};
-use crate::task_env::{LocalSetSpawner, LocalSetTaskEnvironment, TaskEnvironment};
+use crate::task_env::{
+    LocalSetSpawner, LocalSetTaskEnvironment, TaskEnvironment,
+};
 
 pub mod dispatcher;
 pub mod utils;
@@ -21,7 +26,7 @@ const DEFAULT_BATCH_SIZE: usize = 10;
 
 /// A configuration used to tune the concurrency parameters of
 /// the shielded sync and the client used to fetch data.
-#[derive(TypedBuilder)]
+#[derive(Clone, TypedBuilder)]
 pub struct ShieldedSyncConfig<M> {
     client: M,
     #[builder(default = RetryStrategy::Forever)]
@@ -59,7 +64,7 @@ impl TaskEnvironment for MaspLocalTaskEnv {
     async fn run<M, F, R>(self, main: M) -> R
     where
         M: FnOnce(Self::Spawner) -> F,
-        F: Future<Output=R>
+        F: Future<Output = R>,
     {
         self.0.run(main).await
     }
@@ -96,8 +101,8 @@ where
 pub fn trial_decrypt(
     shielded: Transaction,
     vk: ViewingKey,
-    interrupt_flag: AtomicFlag,
-) -> Vec<DecryptedData> {
+    mut interrupted: impl FnMut() -> bool,
+) -> ControlFlow<(), Vec<DecryptedData>> {
     type Proof = OutputDescription<
         <
         <Authorized as Authorization>::SaplingAuth
@@ -105,22 +110,24 @@ pub fn trial_decrypt(
         >::Proof
     >;
 
-    let not_interrupted = || !interrupt_flag.get();
-
     shielded
         .sapling_bundle()
         .map_or(&vec![], |x| &x.shielded_outputs)
         .iter()
-        .take_while(|_| not_interrupted())
-        .filter_map(|so| {
+        .try_fold(vec![], |mut accum, so| {
+            if interrupted() {
+                return ControlFlow::Break(());
+            }
             // Let's try to see if this viewing key can decrypt latest
             // note
-            try_sapling_note_decryption::<_, Proof>(
+            if let Some(data) = try_sapling_note_decryption::<_, Proof>(
                 &NETWORK,
                 1.into(),
                 &PreparedIncomingViewingKey::new(&vk.ivk()),
                 so,
-            )
+            ) {
+                accum.push(data);
+            }
+            ControlFlow::Continue(accum)
         })
-        .collect()
 }
